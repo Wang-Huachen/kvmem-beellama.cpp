@@ -62,6 +62,73 @@ bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v) {
     return true;
 }
 
+bool kvmem_parse_kvarn(const char * s, llama_kvarn_params * out) {
+    if (!s || !out) {
+        return false;
+    }
+    if (std::strcmp(s, "off") == 0 || std::strcmp(s, "none") == 0 ||
+        std::strcmp(s, "disabled") == 0) {
+        *out = llama_kvarn_default_params();
+        return true;
+    }
+    // Accepts exactly what beellama's own CLI accepts: kvarn2..kvarn8, plus the
+    // canonical kvarn_k6v6_g128 spelling. See llama_kvmem_kvarn_type_from_name().
+    const llama_kvarn_type t = llama_kvmem_kvarn_type_from_name(s);
+    if (t == LLAMA_KVARN_TYPE_DISABLED) {
+        // Not a KVarN name (the helper normalises INVALID -> DISABLED). The caller
+        // falls back to the ggml table, which keeps "q8_0" / "f16" working exactly
+        // as before.
+        return false;
+    }
+    *out = llama_kvarn_params_for_type(t);
+    return true;
+}
+
+bool kvmem_kvarn_pair(int32_t bits_k, int32_t bits_v, bool plain_k, bool plain_v,
+                      llama_kvarn_params * out, const char ** err) {
+    if (err) {
+        *err = nullptr;
+    }
+    if (!out) {
+        return false;
+    }
+    if (bits_k == 0 && bits_v == 0) {
+        *out = llama_kvarn_default_params();
+        return true;
+    }
+    // Only one side named a KVarN width: inherit it for the other side. If the
+    // other side was an EXPLICIT plain type, that is a request KVarN cannot honour.
+    if (bits_k == 0) {
+        if (plain_k) {
+            if (err) *err = "-ctv names a KVarN type while -ctk is a plain ggml type. The KVarN "
+                    "record arena stores K and V together, so the two sides cannot use different "
+                    "cache families; asymmetric WIDTHS are fine (-ctk kvarn4 -ctv kvarn2), a "
+                    "KVarN/plain mix is not. Pass -ctk kvarnN, or drop KVarN from -ctv.";
+            return false;
+        }
+        bits_k = bits_v;
+    } else if (bits_v == 0) {
+        if (plain_v) {
+            if (err) *err = "-ctk names a KVarN type while -ctv is a plain ggml type. The KVarN "
+                    "record arena stores K and V together, so the two sides cannot use different "
+                    "cache families; asymmetric WIDTHS are fine (-ctk kvarn4 -ctv kvarn2), a "
+                    "KVarN/plain mix is not. Pass -ctv kvarnN, or drop KVarN from -ctk.";
+            return false;
+        }
+        bits_v = bits_k;
+    }
+    char canon[32];
+    std::snprintf(canon, sizeof(canon), "kvarn_k%dv%d_g128", bits_k, bits_v);
+    const llama_kvarn_type t = llama_kvarn_type_from_name(canon);
+    if (t == LLAMA_KVARN_TYPE_INVALID || t == LLAMA_KVARN_TYPE_DISABLED) {
+        if (err) *err = "unsupported KVarN width pair; valid widths are 2, 3, 4, 5, 6, 8 on each "
+                "side (e.g. kvarn4 on K with kvarn2 on V)";
+        return false;
+    }
+    *out = llama_kvarn_params_for_type(t);
+    return true;
+}
+
 bool kvmem_spec_start(kvmem_spec_session & sess,
                       llama_model * model_tgt,
                       llama_context * ctx_tgt,
@@ -98,6 +165,34 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     // The speculative conversion reads the draft cache types, not the base types.
     p.speculative.draft.cache_type_k = opts.draft_type == GGML_TYPE_COUNT ? opts.type_k : opts.draft_type;
     p.speculative.draft.cache_type_v = opts.draft_type == GGML_TYPE_COUNT ? opts.type_v : opts.draft_type;
+    // KVarN intent travels in its own field: common_base_params_to_speculative()
+    // copies draft.kvarn into the draft result (common/speculative.cpp), and
+    // llama-context audits the draft route per architecture
+    // (llama_kvarn_context_route_for: QWEN35/QWEN35MOE/QWEN4EXP are draft-owned).
+    p.kvarn = opts.kvarn;
+    // KVarN's cache can only remove a whole sequence or the current/previous fp16
+    // tail groups, but KVMem's checkpoint/rollback truncates the target AND the
+    // draft to the same row. The draft is not taken over by KVMem (the MTP
+    // follower is not ported to the record arena yet), so a KVarN draft turns that
+    // rollback into a hard failure: "cannot remove uncommitted MTP rows" followed
+    // by an HTTP 500 (reproduced: scripts/nightly/kvmem-draft-cache-ab.ps1 case 0).
+    // Refuse the configuration instead of silently downgrading it, so nobody ends
+    // up believing the draft cache is KVarN when it is not.
+    // TEMPORARY: the real fix is to port the MTP follower to the KVarN record
+    // arena, which makes the draft's removal a KVMem logical removal again.
+    if (opts.kvmem_enabled && opts.draft_kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        fprintf(stderr,
+                "kvmem_spec_start: the MTP draft cache must not use KVarN while KVMem is enabled.\n"
+                "  KVMem's checkpoint/rollback truncates the draft to the same row as the target, and a\n"
+                "  KVarN cache cannot remove rows in the middle of a sealed record group (only a whole\n"
+                "  sequence or the current/previous fp16 tail groups). The rollback would fail with\n"
+                "  \"cannot remove uncommitted MTP rows\" and the request would end in HTTP 500.\n"
+                "  Drop --spec-kv-dtype / --spec-draft-type-k/-v, or pass a plain type there\n"
+                "  (e.g. --spec-draft-type-k q8_0 --spec-draft-type-v q8_0).\n"
+                "  The target cache can keep using KVarN (--kv-dtype / -ctk).\n");
+        return false;
+    }
+    p.speculative.draft.kvarn = opts.draft_kvarn;
 
     common_params p_dft = common_base_params_to_speculative(p);
     sess.init = common_speculative_init_from_params(p_dft, model_tgt, ctx_tgt);
@@ -300,7 +395,13 @@ kvmem_spec_gen_stats kvmem_spec_generate(
                     mem_tgt ? llama_memory_seq_pos_max(mem_tgt, seq_id) : 0);
 
             if (sess.use_ckpt_dft && ctx_dft) {
-                ckpt.update_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                const auto ckpt_res = ckpt.update_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (!ckpt_res.ok()) {
+                    // the draft rows are re-trimmed below, so this only loses the
+                    // resident draft rows
+                    kvmem_diag("KVMEM_TRACE spec_ckpt update_dft rejected status=%d bytes=%zu\n",
+                            (int) ckpt_res.status, ckpt_res.bytes);
+                }
             }
 
             int n_draft_max = (int) llama_n_ctx(ctx_tgt) - n_past - 2;
@@ -321,12 +422,24 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             const bool host_ckpt = sess.use_ckpt_tgt
                     || (sess.n_rs_tgt > 0 && draft.size() > sess.n_rs_tgt);
             if (!draft.empty() && host_ckpt) {
-                ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                const auto ckpt_res = ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (!ckpt_res.ok()) {
+                    // no target checkpoint means the restore path below cannot put
+                    // the target back, so a short accept must not be retried
+                    kvmem_diag("KVMEM_TRACE spec_ckpt update_tgt rejected status=%d bytes=%zu\n",
+                            (int) ckpt_res.status, ckpt_res.bytes);
+                }
             }
 
             if (ctx_dft) {
                 if (sess.use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    const auto ckpt_res = ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (!ckpt_res.ok()) {
+                        // the draft rows are re-trimmed right below, so this only
+                        // loses the resident draft rows
+                        kvmem_diag("KVMEM_TRACE spec_ckpt load_dft rejected status=%d bytes=%zu\n",
+                                (int) ckpt_res.status, ckpt_res.bytes);
+                    }
                 }
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 if (mem_dft) {
@@ -393,13 +506,25 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             ++st.n_restore;
             llama_kvmem_decode_mean_discard();
             draft = std::move(ids);
-            ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            const auto res_tgt = ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (!res_tgt.ok()) {
+                // the target cannot be rolled back: stop instead of decoding on top
+                // of draft rows that were rejected by verification
+                fprintf(stderr, "KVMem spec rollback rejected (status=%d bytes=%zu)\n",
+                        (int) res_tgt.status, res_tgt.bytes);
+                st.failed = true;
+                break;
+            }
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             if (mem_tgt) {
                 llama_kvmem_remove_logical(ctx_tgt, (llama_pos) ckpt.n_tokens, -1);
             }
             if (ctx_dft) {
-                ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                const auto res_dft = ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (!res_dft.ok()) {
+                    kvmem_diag("KVMEM_TRACE spec_ckpt load_dft rejected status=%d bytes=%zu\n",
+                            (int) res_dft.status, res_dft.bytes);
+                }
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 if (mem_dft) {
                     llama_kvmem_remove_logical(ctx_dft, (llama_pos) ckpt.n_tokens, -1);
@@ -409,7 +534,12 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             smpl = std::move(smpl_save);
             n_past = (int) prompt_tgt.size();
             llama_kvmem_truncate_cached(n_past);
-            if (!driver_ckpt.empty()) common_speculative_set_state(spec, seq_id, driver_ckpt);
+            if (!driver_ckpt.empty() && !common_speculative_set_state(spec, seq_id, driver_ckpt)) {
+                // the draft carry state no longer matches the rolled-back target
+                kvmem_diag("KVMEM_TRACE spec_restore set_state rejected\n");
+                st.failed = true;
+                break;
+            }
             continue;
         }
 
@@ -420,7 +550,10 @@ kvmem_spec_gen_stats kvmem_spec_generate(
                 if (!llama_kvmem_remove_logical(ctx_tgt, n_past, -1) ||
                         (ctx_dft && !llama_kvmem_remove_logical(ctx_dft, n_past, -1))) st.failed = true;
                 llama_kvmem_truncate_cached(n_past);
-                if (!driver_ckpt.empty()) common_speculative_set_state(spec, seq_id, driver_ckpt);
+                if (!driver_ckpt.empty() && !common_speculative_set_state(spec, seq_id, driver_ckpt)) {
+                    kvmem_diag("KVMEM_TRACE spec_abort set_state rejected\n");
+                    st.failed = true;
+                }
             }
             llama_kvmem_decode_mean_discard();
             break;

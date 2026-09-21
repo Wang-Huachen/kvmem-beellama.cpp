@@ -14,6 +14,7 @@
 #include "llama-arch.h"
 #include "llama-cparams.h"
 #include "llama-impl.h"
+#include "llama-kvarn.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
 #include "llama-model.h"
@@ -328,6 +329,23 @@ static bool kvmem_cache_has_layer(const llama_kv_cache * kv, int32_t il) {
     return false;
 }
 
+// The row-shaped K/V paths (stage-in, stage-out, raw-K writeback, dumps) read
+// and write llama_kv_cache storage tensors. Under KVarN those tensors hold no
+// rows: the arena's metadata cache is built with a layer filter that rejects
+// every layer id, so kvmem_cache_has_layer() is always false and each of those
+// paths would skip every layer and then report success. Silently doing nothing
+// is the one outcome the design forbids, so they fail closed instead.
+static bool kvmem_kvarn_row_path_fail_closed(const llama_kv_cache_kvarn * kvarn, const char * what) {
+    if (!kvarn) {
+        return false;
+    }
+    LLAMA_LOG_ERROR("%s: %s is not ported to the KVarN record arena "
+            "(the arena has no row-wise K/V storage); refusing to continue silently\n",
+            __func__, what);
+    GGML_ABORT("%s: %s not ported to the KVarN record arena", __func__, what);
+    return false; // unreachable; GGML_ABORT is noreturn but keep the type honest
+}
+
 static uint32_t kvmem_first_attn_layer(const llama_model & model) {
     const uint32_t n = model.hparams.n_layer();
     for (uint32_t il = 0; il < n; ++il) {
@@ -350,7 +368,7 @@ static uint32_t kvmem_n_attn_layers(const llama_model & model) {
 }
 
 struct kvmem_pool_plan {
-    uint32_t block_tokens = 32;
+    uint32_t block_tokens = KVAR_N_GROUP;
     uint32_t budget = 0;
     uint32_t gen_reserve = 0;
     uint32_t kv_size = 0;
@@ -365,7 +383,26 @@ static kvmem_pool_plan kvmem_compute_pool(
         const llama_memory_params & params,
         const llama_cparams & cparams) {
     kvmem_pool_plan p;
-    p.block_tokens = g_kvmem_params.block_tokens ? g_kvmem_params.block_tokens : 32u;
+    // Block granularity is a property of the STORAGE FORMAT, so it only has to be
+    // pinned when the storage really is a KVarN record arena:
+    //   - KVarN on : one KVMem block must be exactly one 128-token record group.
+    //     The arena is only addressable in whole groups (llama-kv-cache-kvarn.cpp
+    //     asserts kv_size % KVAR_N_GROUP == 0 for non-SWA) and KVMem cannot use the
+    //     SWA escape hatch, so --kvmem-block-tokens is not a tunable there.
+    //   - KVarN off: the inner cache stores plain ggml rows, where any block size
+    //     works. Respect the caller's value so an existing configuration keeps its
+    //     exact pool geometry (a 32-token pool has 4x the slots of a 128-token one).
+    const bool kvarn_on = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
+    if (kvarn_on) {
+        if (g_kvmem_params.block_tokens && g_kvmem_params.block_tokens != KVAR_N_GROUP) {
+            LLAMA_LOG_WARN("%s: --kvmem-block-tokens=%u ignored; the KVarN record arena "
+                    "requires block_tokens=%u\n",
+                    __func__, g_kvmem_params.block_tokens, KVAR_N_GROUP);
+        }
+        p.block_tokens = KVAR_N_GROUP;
+    } else {
+        p.block_tokens = g_kvmem_params.block_tokens ? g_kvmem_params.block_tokens : 32u;
+    }
     uint32_t budget = g_kvmem_params.budget;
     if (budget == 0) {
         budget = kvmem_align_tokens(cparams.n_ctx_seq, p.block_tokens);
@@ -375,6 +412,12 @@ static kvmem_pool_plan kvmem_compute_pool(
     } else {
         budget = kvmem_align_tokens(budget, p.block_tokens);
     }
+    // Never plan a budget larger than the context itself: the pool below is
+    // clamped to n_ctx_seq, and an oversized budget would make the
+    // budget/gen_reserve re-split push the pool back above n_ctx_seq.
+    if (budget > cparams.n_ctx_seq) {
+        budget = kvmem_align_tokens(cparams.n_ctx_seq, p.block_tokens);
+    }
     uint32_t gen_reserve = g_kvmem_params.gen_reserve ? g_kvmem_params.gen_reserve : 256u;
     gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
 
@@ -382,13 +425,36 @@ static kvmem_pool_plan kvmem_compute_pool(
     const uint32_t n_attn = kvmem_n_attn_layers(model);
     const uint32_t n_embd_k = model.hparams.n_embd_k_gqa(il0);
     const uint32_t n_embd_v = model.hparams.n_embd_v_gqa(il0);
-    const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
-    const uint64_t v_row = ggml_row_size(params.type_v, n_embd_v);
-    p.block_bytes = static_cast<uint64_t>(n_attn) * (k_row + v_row) * p.block_tokens;
+    // p.block_bytes must describe what the record arena really costs, not the
+    // fallback ggml row type. Under KVarN, params.type_k/type_v are only the
+    // bit-width-matched fallback (common/arg.cpp maps `kvarn6` -> q6_0); the
+    // real layout is the KVarN tile.
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        const int head_dim = (int) model.hparams.n_embd_head_k(il0);
+        if (llama_kvarn_head_dim_supported(head_dim)) {
+            const llama_kvarn_tile_layout layout = llama_kvarn_make_layout(
+                    head_dim, KVAR_N_GROUP, params.kvarn.key_bits, params.kvarn.value_bits);
+            const int slices = llama_kvarn_head_slices(head_dim);
+            const uint32_t n_head_kv = model.hparams.n_head_kv(il0);
+            // ceil(n_head_kv / slices) tiles per layer; each tile holds one
+            // 128-token group for one head slice, for K and V together.
+            const uint64_t tiles = (uint64_t) n_head_kv * 2u * (uint64_t) slices;
+            p.block_bytes = (uint64_t) n_attn * tiles * layout.tile_bytes;
+        } else {
+            LLAMA_LOG_WARN("%s: head_dim=%d is not KVarN-supported; cannot size the "
+                    "record arena exactly\n", __func__, head_dim);
+        }
+    }
+    if (p.block_bytes == 0) {
+        const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
+        const uint64_t v_row = ggml_row_size(params.type_v, n_embd_v);
+        p.block_bytes = static_cast<uint64_t>(n_attn) * (k_row + v_row) * p.block_tokens;
+    }
+    GGML_ASSERT(p.block_bytes > 0);
 
     const double ratio = kvmem_default_ratio(g_kvmem_params.gpu_memory_ratio, 0.50);
     p.gpu_total = kvmem_first_gpu_total_bytes();
-    if (p.gpu_total > 0 && p.block_bytes > 0 && ratio > 0.0) {
+    if (p.gpu_total > 0 && ratio > 0.0) {
         p.cap_blocks = static_cast<uint32_t>(
                 (p.gpu_total * ratio) / std::max(p.block_bytes, uint64_t{1}));
     }
@@ -415,13 +481,37 @@ static kvmem_pool_plan kvmem_compute_pool(
             }
         }
     }
+    if (kvarn_on) {
+        // The arena sizes itself in whole record groups, and rounding up would
+        // claim more context than cparams.n_ctx_seq allows, so round DOWN.
+        pool = (pool / KVAR_N_GROUP) * KVAR_N_GROUP;
+        if (pool < KVAR_N_GROUP) {
+            pool = KVAR_N_GROUP;
+        }
+    } else {
+        // Plain ggml rows: keep the historical floor of one block.
+        pool = std::max(pool, p.block_tokens);
+    }
+    // The split must stay a split: budget + gen_reserve == pool is the contract
+    // the reselect policy relies on.
+    if (budget + gen_reserve != pool) {
+        if (budget >= pool) {
+            budget = pool - std::min(gen_reserve, p.block_tokens);
+        }
+        if (budget >= pool) {
+            budget = 0;
+        }
+        gen_reserve = pool - budget;
+    }
     p.budget = budget;
     p.gen_reserve = gen_reserve;
-    p.kv_size = std::max(pool, 1u);
+    p.kv_size = pool;
     p.n_slots = (p.kv_size + p.block_tokens - 1) / p.block_tokens;
-    if (p.n_slots * p.block_tokens < p.kv_size) {
-        p.n_slots += 1;
+    if (kvarn_on) {
+        GGML_ASSERT(p.kv_size % KVAR_N_GROUP == 0);
+        GGML_ASSERT(p.n_slots * KVAR_N_GROUP == p.kv_size);
     }
+    GGML_ASSERT(p.budget + p.gen_reserve == p.kv_size);
     return p;
 }
 
@@ -440,6 +530,37 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        // The MTP follower keeps its own row-shaped pool (tag "kvmem-mtp") and
+        // mirrors the target's slot pool. Two ways to end up on the stock draft:
+        //   KVMEM_MTP_FOLLOWER=0 : opt out explicitly. Measured 2026-09-19 on
+        //     Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp: with KVMem on the TARGET, MTP spec
+        //     decoding fails BOTH ways, and identically with the KVarN arena and
+        //     with the plain row cache, so none of it is a KVarN problem:
+        //       follower draft -> "fill_from_target: no target slot for pos N" plus
+        //         "failed to find a memory slot for batch of size 1" every step,
+        //         exit 0, no draft tokens (silent degradation).
+        //       stock draft    -> "llama_decode(ctx_dft) failed rc=-1 (pos=3)" and
+        //         exit 1, after "inconsistent sequence positions ... X = 4 ... Y = 3".
+        //     Without --kvmem both are clean, and with --kvmem both are broken, so
+        //     the defect is in KVMem's MTP interaction and is still undiagnosed.
+        //     The switch exists so the draft half can be moved off KVMem while that
+        //     is investigated; it is not a fix.
+        //   KVarN on : the follower has no record-arena port.
+        const char * follower_env = getenv("KVMEM_MTP_FOLLOWER");
+        const bool want_follower = !(follower_env && follower_env[0] == '0');
+        if (!want_follower) {
+            LLAMA_LOG_WARN("%s: KVMEM_MTP_FOLLOWER=0 -- the MTP draft uses the stock cache. "
+                    "Note that with KVMem on the target MTP spec decoding is broken either "
+                    "way today; disable --spec-type draft-mtp for a working configuration\n",
+                    __func__);
+            return nullptr;
+        }
+        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: KVMem MTP follower is not ported to the KVarN record arena; "
+                    "using the stock memory (the draft still gets its own KVarN cache when "
+                    "beellama's route owns it)\n", __func__);
+            return nullptr;
+        }
         llama_memory_kvmem * tgt = nullptr;
         if (cparams.ctx_other) {
             llama_memory_t mem = llama_get_memory(cparams.ctx_other);
@@ -469,6 +590,18 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (llm_arch_is_hybrid(model.arch)) {
+        // Hybrid is COMPOSED, not wrapped. llama_memory_kvmem_hybrid builds a
+        // llama_memory_kvmem for the attention half and MOVES it into
+        // llama_memory_hybrid, which owns it and calls back into
+        // llama_memory_kvmem::init_kv_batch(). That is what makes the record arena
+        // reachable from a hybrid graph.
+        //
+        // The previous version inherited from llama_memory_hybrid and borrowed the
+        // stock llama_kv_cache that the base class had already built, so the base's
+        // init_kv_batch() never reached KVMem's slot pool and KVarN records were
+        // unreachable -- KVMem had to refuse hybrid + KVarN entirely. The hybrid
+        // wrapper now builds and owns the KVMem object itself, so the arena is
+        // reachable and the base class routes through the KVMem slot pool.
         return new llama_memory_kvmem_hybrid(model, params, cparams);
     }
     return new llama_memory_kvmem(model, params, cparams);
@@ -477,8 +610,7 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
 llama_memory_kvmem::llama_memory_kvmem(
         const llama_model & model,
         const llama_memory_params & params,
-        const llama_cparams & cparams,
-        llama_kv_cache * ext_kv) :
+        const llama_cparams & cparams) :
     model_(model) {
     backend_.owner = this;
     trace_ = kvmem_diag_enabled();
@@ -497,18 +629,70 @@ llama_memory_kvmem::llama_memory_kvmem(
     rt_cfg.store.estimated_gpu_block_capacity = pool.cap_blocks;
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg, &backend_);
 
-    if (ext_kv) {
-        kv_ = ext_kv;
-        if (kv_->get_size() != kv_size_) {
-            LLAMA_LOG_WARN("%s: borrowed attn cache size %u != planned pool %u\n",
-                    __func__, kv_->get_size(), kv_size_);
-            kv_size_ = kv_->get_size();
-            n_slots_ = (kv_size_ + block_tokens_ - 1) / block_tokens_;
-            if (n_slots_ * block_tokens_ < kv_size_) {
-                n_slots_ += 1;
-            }
-        }
+    // The attention cache owns ONLY the non-recurrent layers. The stock hybrid
+    // wrapper supplies exactly this filter when the caller gives none
+    // (llama-memory-hybrid.cpp:54-56: `filter_attn == nullptr ? [&](int32_t il)
+    // { return !hparams.is_recr(il); } : filter_attn`). KVMem owns its cache
+    // directly, so it must bring the filter itself: `llama_kv_cache` only skips
+    // layers where `hparams.has_kv(il)` is false (llama-kv-cache.cpp:823-832), and
+    // for a hybrid model that admits EVERY layer.
+    //
+    // Measured on Qwen3.8-27B before this fix:
+    //   7531397120 B / 53248 cells / 2176 B per q8_0 K+V layer = 65 layers
+    // (= the model's full layer count, incl. the MTP head) instead of the 16
+    // attention layers -- 65/16 = 4.0625x the intended bytes. With the 11.3 GB
+    // model that overflowed the 16 GB card (peak 15920 of 16311 MiB), Windows
+    // fell back to host memory and decode collapsed from ~31 t/s to ~7.6 t/s.
+    //
+    // Dense models are unaffected: is_recr(il) is false for every layer there.
+    const llama_memory_i::layer_filter_cb kvmem_attn_filter =
+            [&model](int32_t il) { return !model.hparams.is_recr(il); };
+
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        // KVarN on: the record arena becomes KVMem's storage. One KVMem slot
+        // <=> one 128-token record group. `unified` is true and n_seq_max is 1,
+        // which is what KVMem has always required and what keeps
+        // uses_compact_read_indices() false so the stage_slots path (and its
+        // hard assertions) stays dormant in the arena.
+        // NOTE: no extra scratch slot is allocated. An earlier attempt reserved
+        // one so layout_gpu_slots_by_orig_pos() could park a record while
+        // rotating a cycle, but full slot reordering turned out to conflict with
+        // KVarN's own allocation-group state (the metadata cache keeps a per-group
+        // stage-slot mapping that full reordering invalidates), so the constraint is
+        // met by evicting the occupant of the top slot instead -- which needs no
+        // scratch space at all.
+        kvarn_owned_ = std::make_unique<llama_kv_cache_kvarn>(
+                model,
+                model.hparams,
+                params.kvarn,
+                /* offload */ cparams.offload_kqv,
+                /* unified */ true,
+                kv_size_,
+                /* n_seq_max */ 1,
+                /* n_batch */ cparams.n_batch,
+                /* n_ubatch */ cparams.n_ubatch,
+                /* n_pad */ 1,
+                model.hparams.n_swa,
+                model.hparams.swa_type,
+                /* filter */ kvmem_attn_filter,
+                /* reuse */ nullptr,
+                /* tail_tokens */ params.kv_tail_tokens,
+                /* tail_type */ params.kv_tail_type,
+                /* tail_tokens_requested */ params.kv_tail_tokens_requested,
+                /* tail_rollback_tokens */ params.kv_tail_rollback_tokens);
+        kvarn_ = kvarn_owned_.get();
+        // The arena is the only owner of the records. Everything that is pure
+        // cell bookkeeping goes through the metadata cache it exposes, which
+        // carries zero layers (its layer filter rejects every id) -- so any
+        // row-shaped access through kv_ would silently no-op.
+        kv_ = kvarn_->get_metadata_cache();
+        GGML_ASSERT(kv_ != nullptr);
     } else {
+        // KVarN off: KVMem's storage is a plain row cache, exactly as before
+        // batch 3. kvarn_ stays null, which is what makes every KVarN-specific
+        // branch (record moves, fail-closed row guards, tail forwarding) fall
+        // back to the row behaviour. Do NOT construct a KVarN arena with
+        // disabled params: its constructor asserts on key_bits == 0.
         kv_owned_ = std::make_unique<llama_kv_cache>(
                 model,
                 model.hparams,
@@ -522,10 +706,17 @@ llama_memory_kvmem::llama_memory_kvmem(
                 /* n_pad */ 1,
                 model.hparams.n_swa,
                 model.hparams.swa_type,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
+                /* mem_other */ nullptr,
+                /* filter */ kvmem_attn_filter,
+                /* reuse */ nullptr,
+                /* share  */ nullptr,
+                /* n_ubatch */ cparams.n_ubatch,
+                /* tail_tokens */ params.kv_tail_tokens,
+                /* tail_type */ params.kv_tail_type,
+                /* tail_tokens_requested */ params.kv_tail_tokens_requested,
+                /* tail_metadata_only */ false,
+                /* tail_rollback_tokens */ params.kv_tail_rollback_tokens,
+                /* tail_visibility_window */ 0,
                 "kvmem");
         kv_ = kv_owned_.get();
     }
@@ -578,21 +769,25 @@ llama_memory_kvmem::llama_memory_kvmem(
     kvmem_capture_bind(this);
 
     size_t kv_bytes = 0;
-    if (kv_) {
-        for (const auto & kv : kv_->memory_breakdown()) {
+    {
+        // memory_breakdown() already sums the arena and the metadata cache when
+        // KVMem owns a KVarN arena, and the plain cache otherwise.
+        const auto bd = memory_breakdown();
+        for (const auto & kv : bd) {
             kv_bytes += kv.second;
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u kvarn=%d\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
             (int) g_kvmem_params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
             n_embd_k_, kvmem_n_attn_layers(model),
-            ext_kv ? " hybrid_attn" : "");
-    kvmem_diag("KVMEM_KV_BYTES bytes=%zu cells=%u slots=%u budget=%u pool=%u "
+            kvarn_ ? 1 : 0);
+    fprintf(stderr,
+            "KVMEM_KV_BYTES bytes=%zu cells=%u slots=%u budget=%u pool=%u "
             "ratio=%.2f high=%.2f low=%.2f cap_blocks=%u gpu_total=%llu block_bytes=%llu\n",
             kv_bytes, kv_size_, n_slots_, pool.budget, kv_size_,
             rt_cfg.store.gpu_memory_ratio,
@@ -622,9 +817,52 @@ llama_memory_kvmem::~llama_memory_kvmem() {
 void llama_memory_kvmem::reset_slots() {
     free_slots_.clear();
     free_slots_.reserve(n_slots_);
-    for (int32_t i = static_cast<int32_t>(n_slots_) - 1; i >= 0; --i) {
+    // Ascending order: alloc_slot() takes the front, so slots are handed out
+    // lowest first and the newest block always owns the highest occupied slot
+    // (see alloc_slot()).
+    for (int32_t i = 0; i < static_cast<int32_t>(n_slots_); ++i) {
+        if (i == spare_slot_) {
+            continue;   // reserved as the repack scratch slot, never handed out
+        }
         free_slots_.push_back(i);
     }
+}
+
+// "Does layer il have a KV cache?" -- NOT "does the row cache expose rows for
+// layer il?". Under KVarN `kv_` is the arena's metadata cache whose layer filter
+// rejects every id (llama-kv-cache-kvarn.cpp:1353), so kvmem_cache_has_layer() is
+// false for every layer even though the arena stores them all. Only call sites
+// that use the check as a pure layer-existence test may switch to this; row
+// readers must keep the row predicate so they stay fail-closed.
+bool llama_memory_kvmem::kvmem_layer_has_kv(int32_t il) const {
+    if (il < 0 || static_cast<uint32_t>(il) >= n_layer_) {
+        return false;
+    }
+    if (kvarn_) {
+        // The arena is built with a null layer filter, so it holds every layer the
+        // graph builds K/V for. Capture data only ever exists for attention
+        // layers; the per-layer value checks downstream reject the rest.
+        return true;
+    }
+    return kvmem_cache_has_layer(kv_, il);
+}
+
+llama_kvmem_retrieval_stats llama_memory_kvmem::retrieval_stats() const {
+    llama_kvmem_retrieval_stats out;
+    out.method     = method_;
+    out.runs       = retr_runs_;
+    out.blocks     = retr_blocks_;
+    out.resident   = retr_resident_;
+    out.have_block = retr_have_;
+    out.q_layers   = retr_q_layers_;
+    out.scored     = retr_scored_;
+    out.max_score  = retr_max_score_;
+    out.reg_k      = retr_reg_k_;
+    out.reg_q      = retr_reg_q_;
+    out.write_k    = retr_write_k_;
+    out.write_q    = retr_write_q_;
+    out.no_capture_hooks = (retr_reg_k_ == 0 && retr_reg_q_ == 0) ? 1 : 0;
+    return out;
 }
 
 void llama_memory_kvmem::reset_policy() {
@@ -691,12 +929,169 @@ llama_pos llama_memory_kvmem::recr_pos_max() const {
     return recr_ ? recr_->seq_pos_max(0) : (llama_pos) -1;
 }
 
+uint32_t llama_memory_kvmem::virtual_slot_of(uint32_t block_id) const {
+    // Row mode: no virtualization, the physical slot IS the number KVarN sees.
+    if (!kvarn_) {
+        return block_id < runtime_->store().block_count()
+                ? static_cast<uint32_t>(std::max(0, runtime_->store().blocks()[block_id].gpu_slot))
+                : 0u;
+    }
+    if (block_id < vslot_.size() && vslot_[block_id] >= 0) {
+        return static_cast<uint32_t>(vslot_[block_id]);
+    }
+    // Not resident / not mapped: fall back to the physical slot so callers never see
+    // a stale virtual number.
+    return block_id < runtime_->store().block_count()
+            ? static_cast<uint32_t>(std::max(0, runtime_->store().blocks()[block_id].gpu_slot))
+            : 0u;
+}
+
+// Cell addressing that survives the KVarN arena: the arena numbers its groups by
+// ADMISSION ORDER (virtual slot), because the read side infers "which group is
+// still being written" from the numeric maximum of the indices it is handed. Any
+// consumer that fills or reads cells must use the same numbers occupy_in() uses --
+// physical slot numbers are only for allocation and record placement. In row mode
+// virtual_slot_of() returns gpu_slot, so both helpers are exact no-ops.
+bool llama_memory_kvmem::slot_for_orig_pos_virtual(llama_pos pos, int32_t * slot, uint32_t * off) const {
+    int32_t phys = -1;
+    uint32_t o = 0;
+    if (!slot_for_orig_pos(pos, &phys, &o)) {
+        return false;
+    }
+    const int32_t bid = runtime_->store().block_id_containing(pos);
+    if (bid < 0) {
+        // The token is not registered on the store yet. slot_for_orig_pos() above
+        // already resolved that case on purpose (it keeps the token in the tail
+        // block if there is room, otherwise it peeks the next free slot), so the
+        // physical answer is the whole answer -- there is no block id to translate.
+        //
+        // Returning false here is what broke the MTP follower: it asks for the
+        // target's slot of a position that the target has not registered yet, so
+        // llama-memory-kvmem-mtp.cpp:183 printed "no target slot for pos N" on
+        // every single step and spec decoding silently produced no draft tokens.
+        // Note that without a KVarN arena assign_virtual_slots() is a no-op, so the
+        // virtual mapping really is the identity in the row-cache case.
+        if (slot) {
+            *slot = phys;
+        }
+        if (off) {
+            *off = o;
+        }
+        return true;
+    }
+    if (slot) {
+        *slot = static_cast<int32_t>(virtual_slot_of(static_cast<uint32_t>(bid)));
+    }
+    if (off) {
+        *off = o;
+    }
+    return true;
+}
+
+uint32_t llama_memory_kvmem::block_cell_base(uint32_t block_id) const {
+    return virtual_slot_of(block_id) * block_tokens_;
+}
+
+void llama_memory_kvmem::assign_virtual_slots() {
+    if (!kvarn_) {
+        return;
+    }
+    auto & store = runtime_->store();
+    const uint32_t nblk = store.block_count();
+    if (vslot_.size() < nblk) {
+        vslot_.resize(nblk, -1);
+        vorder_.resize(nblk, 0);
+    }
+
+    // A block that just entered the GPU working set takes a new admission stamp.
+    // (Evicted blocks keep their stamp so they do not need to be re-stamped if they
+    // are still resident; a re-admitted block gets a strictly larger one.)
+    for (uint32_t id = 0; id < nblk; ++id) {
+        const int32_t slot = store.blocks()[id].gpu_slot;
+        if (slot >= 0 && vslot_[id] < 0) {
+            vorder_[id] = ++vorder_next_;
+        }
+    }
+
+    // Rank the resident blocks by admission order: oldest gets virtual 0, newest the
+    // highest number. This is the invariant KVarN needs -- an incomplete group is
+    // always the newest, so it must carry the largest index KVarN ever sees.
+    std::vector<uint32_t> live;
+    live.reserve(nblk);
+    for (uint32_t id = 0; id < nblk; ++id) {
+        if (store.blocks()[id].gpu_slot >= 0 && store.blocks()[id].n_tokens > 0) {
+            live.push_back(id);
+        }
+    }
+    std::sort(live.begin(), live.end(),
+              [&](uint32_t a, uint32_t b) { return vorder_[a] < vorder_[b]; });
+    for (size_t i = 0; i < live.size(); ++i) {
+        vslot_[live[i]] = static_cast<int32_t>(i);
+    }
+
+    // The partially filled block is the one KVMem keeps writing into, so it has to end
+    // up with the HIGHEST virtual number (the invariant checked below in
+    // prepare_ubatches()). Admission order alone is NOT a reliable proxy for that: the
+    // tail block gets its stamp when its first token arrives, and any eviction /
+    // re-admission churn after that hands other residents a newer stamp -- which pushes
+    // the tail *down* the ranking. Observed with a pool small enough to churn
+    // (--kvmem-budget 12288, 30k-token prompt + retrieval):
+    //   "partial block 240 carries virtual slot 14 but the highest is 95"
+    // KVarN would then read that group from neither the F16 stage (it is not inside
+    // [live_group - (tail_groups - 1), live_group]) nor a record (it is not sealed), and
+    // silently attend to zeros. Force the tail to the top by swapping it with whoever
+    // holds the top number: that block is complete, so `group < live_group` is still
+    // true for it and its sealed record keeps serving it.
+    {
+        int32_t partial = -1;
+        int32_t top     = -1;
+        for (uint32_t id = 0; id < nblk; ++id) {
+            const auto & b = store.blocks()[id];
+            if (b.gpu_slot < 0 || b.n_tokens == 0 || vslot_[id] < 0) {
+                continue;
+            }
+            if (b.n_tokens < block_tokens_) {
+                partial = vslot_[id];
+            }
+            top = std::max(top, vslot_[id]);
+        }
+        if (partial >= 0 && top > partial) {
+            for (uint32_t id = 0; id < nblk; ++id) {
+                if (vslot_[id] == top) {
+                    vslot_[id] = partial;
+                } else if (vslot_[id] == partial) {
+                    vslot_[id] = top;
+                }
+            }
+        }
+    }
+    // Blocks that left the working set must not keep a virtual number.
+    for (uint32_t id = 0; id < nblk; ++id) {
+        if (store.blocks()[id].gpu_slot < 0) {
+            vslot_[id] = -1;
+        }
+    }
+}
+
 int32_t llama_memory_kvmem::alloc_slot() {
     if (free_slots_.empty()) {
         return -1;
     }
-    const int32_t slot = free_slots_.back();
-    free_slots_.pop_back();
+    // Lowest free slot, order-independent (searches for the minimum rather than
+    // trusting how reset_slots()/free_slot() pushed their entries).
+    //
+    // This is now only about physical placement; the number KVarN sees comes from
+    // virtual_slot_of(). Keeping physical allocation ascending means the newest block
+    // also tends to sit highest, which keeps the two numberings aligned in the common
+    // case and makes the invariant easy to reason about.
+    size_t best = 0;
+    for (size_t i = 1; i < free_slots_.size(); ++i) {
+        if (free_slots_[i] < free_slots_[best]) {
+            best = i;
+        }
+    }
+    const int32_t slot = free_slots_[best];
+    free_slots_.erase(free_slots_.begin() + best);
     return slot;
 }
 
@@ -794,7 +1189,15 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
     {
         const int64_t t0 = ggml_time_us();
         for (uint32_t id : plan.stage_out) {
-            harvest_gpu_v(id);
+            if (kvarn_) {
+                // Capture the block's record bytes NOW, before its slot is handed
+                // to somebody else. This is what makes re-admission possible:
+                // KVarN has no row-wise write path, so once the record group is
+                // overwritten the data is gone for good.
+                snapshot_records(id);
+            } else {
+                harvest_gpu_v(id);
+            }
             if (mtp_) {
                 mtp_->on_stage_out(id);
             }
@@ -806,16 +1209,35 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
         }
     }
     {
-        const int64_t t0 = ggml_time_us();
+        // Blocks whose records cannot leave the arena must also not lose their
+        // cells: they are read straight out of the F16 stage, so clearing them
+        // would either make attention read zeros for the group, or let another
+        // block claim the stage rows. Put them back on the GPU and leave their
+        // cells alone. This can push the pool above its budget for as long as
+        // such a block exists, which is the correct trade: the alternative is
+        // silently wrong attention.
+        const uint64_t t0 = ggml_time_us();
         for (uint32_t id : plan.stage_out) {
             if (id >= store.block_count()) {
                 continue;
             }
             const kvmem::KvMemBlock & b = store.blocks()[id];
-            if (b.n_tokens > 0) {
-                kv_->seq_rm_logical(0, static_cast<llama_pos>(b.orig_pos_start),
-                            static_cast<llama_pos>(b.orig_pos_end()));
+            if (b.n_tokens == 0) {
+                continue;
             }
+            if (kvarn_ && !block_records_snapshotable(id)) {
+                if (b.gpu_slot < 0 && b.cpu_slot >= 0) {
+                    // The block did leave the GPU (it has a CPU-tier copy), so ask
+                    // the tier to put it back. Its stage rows may already be gone,
+                    // which is why apply_plan_to_kv() must not have chosen it --
+                    // warn loudly because reaching this means the planner did.
+                    LLAMA_LOG_WARN("%s: block %u is stage-backed (slot 0 or partial) and "
+                            "cannot be evicted, but the planner staged it out\n", __func__, id);
+                }
+                continue;
+            }
+            kv_->seq_rm_logical(0, static_cast<llama_pos>(b.orig_pos_start),
+                        static_cast<llama_pos>(b.orig_pos_end()));
         }
         if (retr_.enabled) {
             retr_.seq_rm_us += ggml_time_us() - t0;
@@ -870,7 +1292,11 @@ void llama_memory_kvmem::occupy_in(llama_kv_cache * cache, uint32_t block_id) {
     std::vector<llama_token> tok(nt, 0);
     llama_seq_id seq0 = 0;
     for (uint32_t t = 0; t < nt; ++t) {
-        sinfo.idxs[0][t] = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_ + t;
+        // Same virtual numbering as kvmem_fill_slot_info(): the cell metadata has to
+        // agree with the indices handed to the arena, or apply_ubatch() and the record
+        // bookkeeping drift apart.
+        const uint32_t vslot = virtual_slot_of(blk.block_id);
+        sinfo.idxs[0][t] = vslot * block_tokens_ + t;
         logical[t] = blk.orig_pos_start + t;
         if ((size_t) logical[t] >= row_positions_.size()) {
             throw std::runtime_error("missing cache row position metadata");
@@ -896,6 +1322,16 @@ void llama_memory_kvmem::occupy_in(llama_kv_cache * cache, uint32_t block_id) {
     {
         const int64_t t0 = ggml_time_us();
         cache->apply_ubatch(sinfo, ub);
+        // apply_ubatch() opens a compact-tail batch transaction (llama-kv-cache.cpp:
+        // tail->begin_batch()) that the normal decode path closes in
+        // llama_kv_cache::finish_tail_batch(). This ubatch is synthetic -- it only
+        // records the cells KVMem just (re-)admitted and no graph follows -- so the
+        // transaction has to be closed here. Leaving it pending makes the next real
+        // decode throw "a compact KV tail batch transaction is already pending",
+        // which surfaces as an HTTP 500 as soon as the pool is small enough to force
+        // stage-in re-admission (reproduced by
+        // scripts/nightly/kvmem-draft-cache-ab.ps1 -Case 2).
+        cache->finish_tail_batch(/* success */ true, /* payload_may_be_modified */ false);
         if (retr_.enabled) {
             retr_.occupy_us += ggml_time_us() - t0;
         }
@@ -914,9 +1350,32 @@ llama_pos llama_memory_kvmem::model_pos(uint32_t logical) const {
     return last.pos[0] + 1 + (llama_pos) (logical - row_positions_.size());
 }
 
+// True when `m` is one of KVMem's own memories: the KVMem object itself, the hybrid
+// wrapper that moves it into llama_memory_hybrid, or the MTP follower.
+static bool kvmem_memory_is_ours(llama_memory_i * m) {
+    if (!m) {
+        return false;
+    }
+    return dynamic_cast<llama_memory_kvmem        *>(m) != nullptr ||
+           dynamic_cast<llama_memory_kvmem_hybrid *>(m) != nullptr ||
+           dynamic_cast<llama_memory_kvmem_mtp    *>(m) != nullptr;
+}
+
 bool llama_memory_kvmem::remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
     ++attention_epoch_;
     if (mtp_ && llama_get_memory(ctx) == mtp_) return mtp_->remove_logical(begin, end);
+    // Never act on our own kv_ on behalf of a context that holds no KVMem. The MTP
+    // draft is exactly that case when KVMEM_MTP_FOLLOWER=0 -- it keeps the stock cache,
+    // yet the driver still routes its rollback through here (tools/kvmem-spec.cpp:524
+    // calls llama_kvmem_remove_logical(ctx_dft, n_past, -1)). Falling through cut the
+    // TARGET's rows -- which line 523 had already rolled back -- and left the draft
+    // untouched, so the draft still held position 4 while its next batch started at 3
+    // and llama-batch.cpp:303 rejected it:
+    //   "inconsistent sequence positions ... X = 4 ... Y = 3" -> llama_decode(ctx_dft) rc=-1
+    llama_memory_i * const native = llama_get_memory(ctx);
+    if (native && !kvmem_memory_is_ours(native)) {
+        return llama_memory_seq_rm(native, 0, begin, end);
+    }
     // Recurrent rollback is only valid across consecutive text positions.
     if (recr_ && end < 0 && begin > 0 && (size_t) begin < row_positions_.size()) {
         const auto p = model_pos(begin);
@@ -929,7 +1388,45 @@ bool llama_memory_kvmem::remove_logical(llama_context * ctx, llama_pos begin, ll
     return kv_->seq_rm_logical(0, begin, end);
 }
 
+bool llama_memory_kvmem::ensure_partial_block_is_live() {
+    // NOT ACTIVE. Repacking the slots here (to give the partial block the live slot
+    // that KVarN requires) is still WIP: the record moves themselves work -- layout
+    // reports move=192 and completes -- but re-registering the cell metadata
+    // afterwards crashes inside apply_ubatch() even though kv_->clear(false) has
+    // emptied every cell, and registering in ascending slot order does not help.
+    // The pool also only has spare_slot_ free because that slot is allocated extra.
+    // Left as a no-op so this path cannot misbehave; the guard at the end of
+    // prepare_ubatches() still refuses to run rather than let attention read zeros.
+    // Moving a record group only becomes safe once the physical and virtual slot
+    // numberings agree; until then this path stays a no-op.
+    return true;
+}
 bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
+    // The reorder below moves records by *physical pool slot* while the KVarN read path
+    // addresses them by the *virtual* admission-order slot (see the NOTE further down).
+    // While the two agree nothing is wrong, but as soon as an eviction makes them differ
+    // the moves touch the wrong groups and the arena is corrupted -- observed as
+    // "prepare_ubatches: partial block is not in the live slot" right after a retrieval
+    // stage-in. Until the two numberings are unified, refuse to run the reorder whenever
+    // a KVarN arena is active.
+    //
+    // This is a *performance* path only (re-laying the pool by original position makes the
+    // following stage-in contiguous): skipping it leaves the data untouched and the caller
+    // falls back to writing the stage-in blocks through the plain path. Hybrid targets used
+    // to reach the code below and abort on their recurrent layer 0 (no records), which
+    // logged an error on every retrieval; dense targets used to move every layer, which is
+    // safe only until an eviction desynchronises the numberings.
+    if (kvarn_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_INFO("%s: record layout by original position disabled while the KVarN "
+                    "arena is active (physical and virtual slot numberings can diverge); "
+                    "stage-in uses the plain path\n", __func__);
+        }
+        return false;
+    }
+
     auto & store = runtime_->store();
     struct Item {
         uint32_t id;
@@ -963,171 +1460,238 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
     }
 
     ++attention_epoch_;
-    std::vector<uint8_t> mtp_res(items.size(), 0);
-    bool mtp_d2d_ok = false;
-    if (mtp_) {
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (items[i].resident &&
-                mtp_->slot_holds(items[i].slot, items[i].orig)) {
-                mtp_res[i] = 1;
+
+    if (!kvarn_) {
+        // ---- stock row-shaped cache: the original two-pass scratch copy ----
+        std::vector<uint8_t> mtp_res(items.size(), 0);
+        bool mtp_d2d_ok = false;
+        if (mtp_) {
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (items[i].resident &&
+                    mtp_->slot_holds(items[i].slot, items[i].orig)) {
+                    mtp_res[i] = 1;
+                }
             }
         }
-    }
 
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
-    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
-    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
-    const uint64_t scratch_stride = kspan + vspan;
+        const size_t krow = ggml_row_size(type_k_, n_embd_k_);
+        const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+        const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
+        const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+        const uint64_t scratch_stride = kspan + vspan;
 
-    std::vector<size_t> res_ix(items.size(), static_cast<size_t>(-1));
-    size_t n_res = 0;
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (items[i].resident) {
-            res_ix[i] = n_res++;
+        std::vector<size_t> res_ix(items.size(), static_cast<size_t>(-1));
+        size_t n_res = 0;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].resident) {
+                res_ix[i] = n_res++;
+            }
         }
-    }
 
-    bool d2d_ok = n_res > 0;
-    uint8_t * scratch = nullptr;
-    if (d2d_ok) {
-        if (cudaMalloc(reinterpret_cast<void **>(&scratch),
-                       static_cast<size_t>(n_res) * scratch_stride) != cudaSuccess) {
+        bool d2d_ok = n_res > 0;
+        uint8_t * scratch = nullptr;
+        if (d2d_ok) {
+            if (cudaMalloc(reinterpret_cast<void **>(&scratch),
+                           static_cast<size_t>(n_res) * scratch_stride) != cudaSuccess) {
+                scratch = nullptr;
+                d2d_ok = false;
+                LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+            }
+            kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+                                    std::max(krow, vrow) * (size_t) block_tokens_);
+        }
+
+        if (d2d_ok) {
+            cudaStream_t st = cudaStreamPerThread;
+            bool copy_ok = true;
+            for (uint32_t il = 0; il < n_layer_ && copy_ok; ++il) {
+                if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+                    continue;
+                }
+                ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
+                ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
+                uint8_t * kbase = kt ? kvmem_cuda_tensor_ptr(kt) : nullptr;
+                uint8_t * vbase = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
+                if (kt && !kbase) {
+                    copy_ok = false;
+                    break;
+                }
+                if (vt && !v_trans_ && !vbase) {
+                    copy_ok = false;
+                    break;
+                }
+                std::vector<const void *> gsrc;
+                std::vector<void *> gdst;
+                std::vector<size_t> gbytes;
+                std::vector<const void *> ssrc;
+                std::vector<void *> sdst;
+                std::vector<size_t> sbytes;
+                gsrc.reserve(n_res * 2);
+                gdst.reserve(n_res * 2);
+                gbytes.reserve(n_res * 2);
+                ssrc.reserve(n_res * 2);
+                sdst.reserve(n_res * 2);
+                sbytes.reserve(n_res * 2);
+                for (size_t i = 0; i < items.size(); ++i) {
+                    if (res_ix[i] == static_cast<size_t>(-1)) {
+                        continue;
+                    }
+                    const uint32_t nt = items[i].n;
+                    const uint32_t src0 = static_cast<uint32_t>(items[i].slot) * block_tokens_;
+                    const uint32_t dst0 = static_cast<uint32_t>(i) * block_tokens_;
+                    uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
+                    if (kbase && krow && nt) {
+                        const size_t nb = static_cast<size_t>(nt) * krow;
+                        gsrc.push_back(kbase + static_cast<size_t>(src0) * krow);
+                        gdst.push_back(slot_sc);
+                        gbytes.push_back(nb);
+                        ssrc.push_back(slot_sc);
+                        sdst.push_back(kbase + static_cast<size_t>(dst0) * krow);
+                        sbytes.push_back(nb);
+                    }
+                    if (vbase && vrow && nt) {
+                        const size_t nb = static_cast<size_t>(nt) * vrow;
+                        gsrc.push_back(vbase + static_cast<size_t>(src0) * vrow);
+                        gdst.push_back(slot_sc + kspan);
+                        gbytes.push_back(nb);
+                        ssrc.push_back(slot_sc + kspan);
+                        sdst.push_back(vbase + static_cast<size_t>(dst0) * vrow);
+                        sbytes.push_back(nb);
+                    }
+                }
+                const int64_t t_g = ggml_time_us();
+                const int ng = static_cast<int>(gsrc.size());
+                if (!kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
+                    for (int j = 0; j < ng && copy_ok; ++j) {
+                        copy_ok = kvmem_d2d(static_cast<uint8_t *>(gdst[j]),
+                                            static_cast<const uint8_t *>(gsrc[j]),
+                                            gbytes[j], st);
+                    }
+                }
+                if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
+                    copy_ok = false;
+                    break;
+                }
+                if (retr_.enabled) {
+                    retr_.layout_d2h_us += ggml_time_us() - t_g;
+                }
+                const int64_t t_s = ggml_time_us();
+                const int ns = static_cast<int>(ssrc.size());
+                if (!kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
+                    for (int j = 0; j < ns && copy_ok; ++j) {
+                        copy_ok = kvmem_d2d(static_cast<uint8_t *>(sdst[j]),
+                                            static_cast<const uint8_t *>(ssrc[j]),
+                                            sbytes[j], st);
+                    }
+                }
+                if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
+                    copy_ok = false;
+                    break;
+                }
+                if (retr_.enabled) {
+                    retr_.layout_h2d_us += ggml_time_us() - t_s;
+                }
+            }
+            cudaFree(scratch);
             scratch = nullptr;
-            d2d_ok = false;
-            LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+            d2d_ok = copy_ok;
+            if (!copy_ok) {
+                LLAMA_LOG_ERROR("%s: layout D2D failed; reloading residents from raw-K\n", __func__);
+            }
+            if (d2d_ok && mtp_) {
+                std::vector<llama_memory_kvmem_mtp::LayoutMove> mm;
+                for (size_t i = 0; i < items.size(); ++i) {
+                    if (!mtp_res[i]) {
+                        continue;
+                    }
+                    mm.push_back({items[i].slot, static_cast<int32_t>(i), items[i].n});
+                }
+                mtp_d2d_ok = mm.empty() || mtp_->layout_d2d(mm.data(), mm.size());
+                if (!mtp_d2d_ok) {
+                    LLAMA_LOG_WARN("%s: MTP layout D2D failed; restoring those blocks from raw\n",
+                                   __func__);
+                }
+            }
+        } else if (n_res > 0) {
+            const uint64_t payload_bytes =
+                    static_cast<uint64_t>(n_layer_) * (krow + vrow) * block_tokens_;
+            std::vector<std::vector<uint8_t>> payloads(items.size());
+            const int64_t t_d2h = ggml_time_us();
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (res_ix[i] == static_cast<size_t>(-1) || payload_bytes == 0) {
+                    continue;
+                }
+                payloads[i].assign(static_cast<size_t>(payload_bytes), 0);
+                copy_gpu_block_to_host(items[i].id, items[i].slot,
+                                       payloads[i].data(), payload_bytes);
+            }
+            if (retr_.enabled) {
+                retr_.layout_d2h_us += ggml_time_us() - t_d2h;
+            }
+            {
+                const int64_t t0 = ggml_time_us();
+                for (const auto & it : items) {
+                    kv_->seq_rm_logical(0, static_cast<llama_pos>(it.orig),
+                                static_cast<llama_pos>(it.orig + it.n));
+                    if (mtp_) {
+                        mtp_->remove_logical(static_cast<llama_pos>(it.orig),
+                                     static_cast<llama_pos>(it.orig + it.n));
+                    }
+                    store.set_block_gpu_slot(it.id, -1);
+                }
+                if (retr_.enabled) {
+                    retr_.seq_rm_us += ggml_time_us() - t0;
+                }
+            }
+            reset_slots();
+            if (trace_) {
+                fprintf(stderr, "KVMEM_TRACE layout_orig_pos");
+                for (size_t i = 0; i < items.size(); ++i) {
+                    fprintf(stderr, " %u", items[i].id);
+                }
+                fprintf(stderr, "\n");
+            }
+            uint32_t n_move = 0;
+            uint32_t n_raw = 0;
+            for (size_t i = 0; i < items.size(); ++i) {
+                const int32_t slot = alloc_slot();
+                if (slot < 0) {
+                    LLAMA_LOG_ERROR("%s: no GPU slot while laying out block %u\n",
+                                    __func__, items[i].id);
+                    return false;
+                }
+                store.set_block_gpu_slot(items[i].id, slot);
+                store.set_block_tier(items[i].id, kvmem::KvTier::GPU, -1,
+                                     store.blocks()[items[i].id].nvme_slot);
+                if (items[i].resident && !payloads[i].empty()) {
+                    occupy_block_cells(items[i].id);
+                    const int64_t t_h2d = ggml_time_us();
+                    copy_gpu_block_from_host(items[i].id, slot,
+                                             payloads[i].data(), payload_bytes);
+                    if (retr_.enabled) {
+                        retr_.layout_h2d_us += ggml_time_us() - t_h2d;
+                    }
+                    n_move++;
+                } else {
+                    write_block_to_gpu(items[i].id);
+                    n_raw++;
+                }
+            }
+            if (retr_.enabled) {
+                retr_.n_move += n_move;
+                retr_.n_raw += n_raw;
+                retr_.laid_out = 1;
+            }
+            kvmem_stagein_flush_sync(retr_.enabled ? &retr_.copy_us : nullptr,
+                                     retr_.enabled ? &retr_.rope_us : nullptr,
+                                     retr_.enabled ? &retr_.hadamard_us : nullptr,
+                                     retr_.enabled ? &retr_.set_us : nullptr);
+            if (trace_) {
+                fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u\n", n_move, n_raw);
+            }
+            return true;
         }
-        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
-                                std::max(krow, vrow) * (size_t) block_tokens_);
-    }
 
-    if (d2d_ok) {
-        cudaStream_t st = cudaStreamPerThread;
-        bool copy_ok = true;
-        for (uint32_t il = 0; il < n_layer_ && copy_ok; ++il) {
-            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
-                continue;
-            }
-            ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
-            ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
-            uint8_t * kbase = kt ? kvmem_cuda_tensor_ptr(kt) : nullptr;
-            uint8_t * vbase = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
-            if (kt && !kbase) {
-                copy_ok = false;
-                break;
-            }
-            if (vt && !v_trans_ && !vbase) {
-                copy_ok = false;
-                break;
-            }
-            std::vector<const void *> gsrc;
-            std::vector<void *> gdst;
-            std::vector<size_t> gbytes;
-            std::vector<const void *> ssrc;
-            std::vector<void *> sdst;
-            std::vector<size_t> sbytes;
-            gsrc.reserve(n_res * 2);
-            gdst.reserve(n_res * 2);
-            gbytes.reserve(n_res * 2);
-            ssrc.reserve(n_res * 2);
-            sdst.reserve(n_res * 2);
-            sbytes.reserve(n_res * 2);
-            for (size_t i = 0; i < items.size(); ++i) {
-                if (res_ix[i] == static_cast<size_t>(-1)) {
-                    continue;
-                }
-                const uint32_t nt = items[i].n;
-                const uint32_t src0 = static_cast<uint32_t>(items[i].slot) * block_tokens_;
-                const uint32_t dst0 = static_cast<uint32_t>(i) * block_tokens_;
-                uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
-                if (kbase && krow && nt) {
-                    const size_t nb = static_cast<size_t>(nt) * krow;
-                    gsrc.push_back(kbase + static_cast<size_t>(src0) * krow);
-                    gdst.push_back(slot_sc);
-                    gbytes.push_back(nb);
-                    ssrc.push_back(slot_sc);
-                    sdst.push_back(kbase + static_cast<size_t>(dst0) * krow);
-                    sbytes.push_back(nb);
-                }
-                if (vbase && vrow && nt) {
-                    const size_t nb = static_cast<size_t>(nt) * vrow;
-                    gsrc.push_back(vbase + static_cast<size_t>(src0) * vrow);
-                    gdst.push_back(slot_sc + kspan);
-                    gbytes.push_back(nb);
-                    ssrc.push_back(slot_sc + kspan);
-                    sdst.push_back(vbase + static_cast<size_t>(dst0) * vrow);
-                    sbytes.push_back(nb);
-                }
-            }
-            const int64_t t_g = ggml_time_us();
-            const int ng = static_cast<int>(gsrc.size());
-            if (!kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
-                for (int j = 0; j < ng && copy_ok; ++j) {
-                    copy_ok = kvmem_d2d(static_cast<uint8_t *>(gdst[j]),
-                                        static_cast<const uint8_t *>(gsrc[j]),
-                                        gbytes[j], st);
-                }
-            }
-            if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
-                copy_ok = false;
-                break;
-            }
-            if (retr_.enabled) {
-                retr_.layout_d2h_us += ggml_time_us() - t_g;
-            }
-            const int64_t t_s = ggml_time_us();
-            const int ns = static_cast<int>(ssrc.size());
-            if (!kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
-                for (int j = 0; j < ns && copy_ok; ++j) {
-                    copy_ok = kvmem_d2d(static_cast<uint8_t *>(sdst[j]),
-                                        static_cast<const uint8_t *>(ssrc[j]),
-                                        sbytes[j], st);
-                }
-            }
-            if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
-                copy_ok = false;
-                break;
-            }
-            if (retr_.enabled) {
-                retr_.layout_h2d_us += ggml_time_us() - t_s;
-            }
-        }
-        cudaFree(scratch);
-        scratch = nullptr;
-        d2d_ok = copy_ok;
-        if (!copy_ok) {
-            LLAMA_LOG_ERROR("%s: layout D2D failed; reloading residents from raw-K\n", __func__);
-        }
-        if (d2d_ok && mtp_) {
-            std::vector<llama_memory_kvmem_mtp::LayoutMove> mm;
-            for (size_t i = 0; i < items.size(); ++i) {
-                if (!mtp_res[i]) {
-                    continue;
-                }
-                mm.push_back({items[i].slot, static_cast<int32_t>(i), items[i].n});
-            }
-            mtp_d2d_ok = mm.empty() || mtp_->layout_d2d(mm.data(), mm.size());
-            if (!mtp_d2d_ok) {
-                LLAMA_LOG_WARN("%s: MTP layout D2D failed; restoring those blocks from raw\n",
-                               __func__);
-            }
-        }
-    } else if (n_res > 0) {
-        const uint64_t payload_bytes =
-                static_cast<uint64_t>(n_layer_) * (krow + vrow) * block_tokens_;
-        std::vector<std::vector<uint8_t>> payloads(items.size());
-        const int64_t t_d2h = ggml_time_us();
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (res_ix[i] == static_cast<size_t>(-1) || payload_bytes == 0) {
-                continue;
-            }
-            payloads[i].assign(static_cast<size_t>(payload_bytes), 0);
-            copy_gpu_block_to_host(items[i].id, items[i].slot,
-                                   payloads[i].data(), payload_bytes);
-        }
-        if (retr_.enabled) {
-            retr_.layout_d2h_us += ggml_time_us() - t_d2h;
-        }
         {
             const int64_t t0 = ggml_time_us();
             for (const auto & it : items) {
@@ -1163,13 +1727,10 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             store.set_block_gpu_slot(items[i].id, slot);
             store.set_block_tier(items[i].id, kvmem::KvTier::GPU, -1,
                                  store.blocks()[items[i].id].nvme_slot);
-            if (items[i].resident && !payloads[i].empty()) {
+            if (items[i].resident && d2d_ok) {
                 occupy_block_cells(items[i].id);
-                const int64_t t_h2d = ggml_time_us();
-                copy_gpu_block_from_host(items[i].id, slot,
-                                         payloads[i].data(), payload_bytes);
-                if (retr_.enabled) {
-                    retr_.layout_h2d_us += ggml_time_us() - t_h2d;
+                if (mtp_ && mtp_res[i] && mtp_d2d_ok) {
+                    mtp_->occupy_block(items[i].id);
                 }
                 n_move++;
             } else {
@@ -1187,72 +1748,207 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
                                  retr_.enabled ? &retr_.hadamard_us : nullptr,
                                  retr_.enabled ? &retr_.set_us : nullptr);
         if (trace_) {
-            kvmem_diag("KVMEM_TRACE layout_writeback move=%u raw=%u\n", n_move, n_raw);
+            fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u d2d=%d\n",
+                    n_move, n_raw, (int) d2d_ok);
         }
         return true;
     }
 
-    {
-        const int64_t t0 = ggml_time_us();
+    // ---- KVarN arena: permute whole record groups in place ----
+    //
+    // One KVMem block is exactly one record group, and under KVarN a group's
+    // identity IS the physical slot it occupies. Reordering the slot table is
+    // therefore a reordering of whole records, and each group moves as exactly
+    // nb[2] contiguous bytes.
+    //
+    // Nothing here touches a logical position, and that is what keeps the records
+    // valid: their K already carries the RoPE phase of orig_pos_start and lives in
+    // the Hadamard domain, so a record is only transferable while the data it
+    // holds keeps its original position. That invariant is exactly what KVMem
+    // maintains -- it reorders physical slots and never rewrites positions.
+    //
+    // move_record_group() does not synchronise and the previous graph may still be
+    // reading the arena, so drain it first. init_update() captures the context
+    // process_ubatch() hands us immediately before the init_batch loop, which
+    // makes it the freshest possible one.
+    if (!sync_ctx_) {
+        LLAMA_LOG_ERROR("%s: no context to synchronise before moving records\n", __func__);
+        return false;
+    }
+    llama_synchronize(sync_ctx_);
+
+    // The permutation is a set of cycles, so a naive slot->slot chain would
+    // overwrite a record that has not been read yet. Borrow one slot that no block
+    // targets and rotate every cycle through it. Under KVarN that slot is reserved
+    // up front (spare_slot_), because the pool is typically full when this runs and
+    // a free slot would not exist to borrow.
+    int32_t spare_slot = spare_slot_;
+    if (spare_slot < 0) {
+        // Claim the slots that are actually occupied. Deriving them from the item
+        // count instead assumed the occupied slots are exactly {0..M-1}, so the
+        // borrowed "spare" could already hold live records and be overwritten.
+        std::vector<uint8_t> claimed(n_slots_, 0);
         for (const auto & it : items) {
-            kv_->seq_rm_logical(0, static_cast<llama_pos>(it.orig),
-                        static_cast<llama_pos>(it.orig + it.n));
-            if (mtp_) {
-                mtp_->remove_logical(static_cast<llama_pos>(it.orig),
-                             static_cast<llama_pos>(it.orig + it.n));
+            if (it.slot >= 0 && static_cast<size_t>(it.slot) < claimed.size()) {
+                claimed[it.slot] = 1;
             }
-            store.set_block_gpu_slot(it.id, -1);
         }
-        if (retr_.enabled) {
-            retr_.seq_rm_us += ggml_time_us() - t0;
+        for (uint32_t s = 0; s < n_slots_; ++s) {
+            if (!claimed[s]) {
+                spare_slot = static_cast<int32_t>(s);
+                break;
+            }
         }
     }
-    reset_slots();
-    if (trace_) {
-        kvmem_diag("KVMEM_TRACE layout_orig_pos");
-        for (size_t i = 0; i < items.size(); ++i) {
-            fprintf(stderr, " %u", items[i].id);
-        }
-        fprintf(stderr, "\n");
+    if (spare_slot < 0) {
+        LLAMA_LOG_ERROR("%s: the record pool is completely full (%zu/%u slots), so there is no "
+                "spare slot to break the slot permutation\n", __func__, items.size(), n_slots_);
+        return false;
     }
-    uint32_t n_move = 0;
-    uint32_t n_raw = 0;
+    // Build the permutation explicitly.
+    //
+    // dest_of[i] = the physical slot the i-th block by orig_pos must end up in. A
+    // sorted layout means slot i holds the i-th block, so the destination of rank i
+    // is simply i. pos_of_slot[s] = index of the block currently in slot s, or -1.
+    std::vector<int32_t> dest_of(items.size(), -1);
     for (size_t i = 0; i < items.size(); ++i) {
-        const int32_t slot = alloc_slot();
-        if (slot < 0) {
-            LLAMA_LOG_ERROR("%s: no GPU slot while laying out block %u\n",
-                            __func__, items[i].id);
+        dest_of[i] = static_cast<int32_t>(i);
+    }
+    std::vector<int32_t> pos_of_slot(n_slots_, -1);
+    for (size_t i = 0; i < items.size(); ++i) {
+        const int32_t s = items[i].slot;
+        if (s >= 0 && static_cast<size_t>(s) < pos_of_slot.size()) {
+            pos_of_slot[s] = static_cast<int32_t>(i);
+        }
+    }
+
+    // Which logical entries still need moving, in destination-slot order. Sorting
+    // by destination means rotating each cycle always lands the last element in a
+    // free slot, so the spare slot is never both source and target.
+    std::vector<size_t> todo;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].slot != dest_of[i]) {
+            todo.push_back(i);
+        }
+    }
+    std::sort(todo.begin(), todo.end(),
+              [&](size_t a, size_t b) { return dest_of[a] < dest_of[b]; });
+
+    // NOTE (known defect): this reorder
+    // mixes two numberings. It moves records by *physical pool slot* (b.gpu_slot),
+    // while the KVarN read path addresses records by the *virtual* admission-order
+    // slot handed out in occupy_in(). While the two agree nothing is wrong; once
+    // evictions make them differ, the moves touch the wrong groups and the arena is
+    // corrupted (observed as "prepare_ubatches: partial block is not in the live
+    // slot" right after the retrieval stage-in).
+    //
+    // Layer 0 of a hybrid model is recurrent (is_recr) and owns no records, so
+    // move_record_group() fails on the very first iteration and nothing is moved:
+    // the caller then simply writes the stage-in blocks without reordering. That
+    // early abort is currently the ONLY thing keeping hybrid targets safe, so it
+    // must not be "fixed" by skipping recurrent layers until the numbering above is
+    // made consistent. Dense targets move every layer, which is fine only while no
+    // eviction has made physical and virtual slots diverge.
+    uint64_t moves = 0;
+    for (size_t t = 0; t < todo.size(); ++t) {
+        const size_t k = todo[t];
+        const int32_t dst = dest_of[k];
+        if (items[k].slot == dst) {
+            continue;   // already placed by an earlier rotation
+        }
+        // Park the block destined for dst, then chase the cycle. Because todo is
+        // ordered by destination, the element we would overwrite has already been
+        // moved or is the spare.
+        const int32_t parked = items[k].slot;
+        bool ok = true;
+        for (uint32_t il = 0; ok && il < n_layer_; ++il) {
+            ok = kvarn_->move_record_group(static_cast<int32_t>(il), parked, spare_slot);
+            ++moves;
+        }
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: failed to park group %d in the spare slot\n", __func__, parked);
             return false;
         }
-        store.set_block_gpu_slot(items[i].id, slot);
-        store.set_block_tier(items[i].id, kvmem::KvTier::GPU, -1,
-                             store.blocks()[items[i].id].nvme_slot);
-        if (items[i].resident && d2d_ok) {
-            occupy_block_cells(items[i].id);
-            if (mtp_ && mtp_res[i] && mtp_d2d_ok) {
-                mtp_->occupy_block(items[i].id);
+        if (parked >= 0 && static_cast<size_t>(parked) < pos_of_slot.size()) {
+            pos_of_slot[parked] = -1;
+        }
+        pos_of_slot[spare_slot] = static_cast<int32_t>(k);
+        items[k].slot = spare_slot;
+
+        int32_t carry = parked;
+        for (;;) {
+            if (carry < 0 || static_cast<size_t>(carry) >= pos_of_slot.size() ||
+                pos_of_slot[carry] < 0) {
+                break;   // the spare: the cycle closes here
             }
-            n_move++;
-        } else {
-            write_block_to_gpu(items[i].id);
-            n_raw++;
+            const int32_t j = pos_of_slot[carry];
+            if (dest_of[j] == carry) {
+                break;   // already correct, nothing to chase
+            }
+            const int32_t target = dest_of[j];
+            for (uint32_t il = 0; ok && il < n_layer_; ++il) {
+                ok = kvarn_->move_record_group(static_cast<int32_t>(il),
+                        static_cast<uint32_t>(carry), static_cast<uint32_t>(target));
+                ++moves;
+            }
+            if (!ok) {
+                LLAMA_LOG_ERROR("%s: failed to rotate slot %d into %d\n",
+                        __func__, carry, target);
+                return false;
+            }
+            pos_of_slot[target] = j;
+            pos_of_slot[carry] = -1;
+            items[j].slot = target;
+            carry = target;
+        }
+
+        // Put the parked block where it belongs.
+        for (uint32_t il = 0; ok && il < n_layer_; ++il) {
+            ok = kvarn_->move_record_group(static_cast<int32_t>(il), spare_slot,
+                    static_cast<uint32_t>(dst));
+            ++moves;
+        }
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: failed to close the slot cycle into %d\n", __func__, dst);
+            return false;
+        }
+        pos_of_slot[dst] = static_cast<int32_t>(k);
+        pos_of_slot[spare_slot] = -1;
+        items[k].slot = dst;
+    }
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].slot != dest_of[i]) {
+            LLAMA_LOG_ERROR("%s: block %u ended in slot %d, expected %d\n",
+                    __func__, items[i].id, items[i].slot, dest_of[i]);
+            return false;
         }
     }
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        store.set_block_gpu_slot(items[i].id, items[i].slot);
+        store.set_block_tier(items[i].id, kvmem::KvTier::GPU, -1,
+                             store.blocks()[items[i].id].nvme_slot);
+    }
+
     if (retr_.enabled) {
-        retr_.n_move += n_move;
-        retr_.n_raw += n_raw;
+        retr_.n_move += static_cast<uint32_t>(items.size());
         retr_.laid_out = 1;
     }
-    kvmem_stagein_flush_sync(retr_.enabled ? &retr_.copy_us : nullptr,
-                             retr_.enabled ? &retr_.rope_us : nullptr,
-                             retr_.enabled ? &retr_.hadamard_us : nullptr,
-                             retr_.enabled ? &retr_.set_us : nullptr);
     if (trace_) {
-        kvmem_diag("KVMEM_TRACE layout_writeback move=%u raw=%u d2d=%d\n",
-                n_move, n_raw, (int) d2d_ok);
+        fprintf(stderr, "KVMEM_TRACE layout_writeback move=%llu raw=0 kvarn=1\n",
+                (unsigned long long) moves);
     }
+    // Note on partial blocks: their record group is moved whole, so the unused
+    // tail of that 128-token record keeps whatever bytes the target group held.
+    // Metadata marks those cells empty, so nothing attends to them, and the block
+    // is stage-backed anyway (it is the live group). This stays correct only as
+    // long as a partial block is never evicted; apply_plan_to_kv() keeps it
+    // resident for exactly that reason.
     return true;
 }
+
+
 
 bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     if (n_new_tokens == 0) {
@@ -1339,6 +2035,7 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
             return false;
         }
     }
+
     return true;
 }
 
@@ -1367,14 +2064,59 @@ bool llama_memory_kvmem::prepare_ubatches(
             row.token = ub.token ? ub.token[i] : LLAMA_TOKEN_NULL;
         }
     }
+    // Refresh the virtual slot numbers now that this batch's admissions are settled.
+    // Must happen before sinfos are built, since those carry the numbers handed to
+    // the arena. Cheap: it only ranks the resident blocks.
+    assign_virtual_slots();
     sinfos.clear();
     sinfos.reserve(ubatches.size());
     for (const auto & ubatch : ubatches) {
         llama_kv_cache::slot_info sinfo;
-        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo)) {
+        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo, vslot_)) {
             return false;
         }
         sinfos.push_back(std::move(sinfo));
+    }
+    if (kvarn_) {
+        // INVARIANT (KVarN): the partially filled block must carry the HIGHEST slot
+        // number -- **as KVarN sees it**, which is the virtual number, not the
+        // physical slot. This check therefore reads virtual_slot_of().
+        //
+        // An incomplete group is never sealed into a record, so the read side serves
+        // it from the F16 stage -- but only while it is the live group
+        // (fattn-mma-kvarn.cuh: `group_from_stage` is `group==0 ||
+        // (group==live_group && live_pos < 127)`, and `group_from_record` requires
+        // `completed`, i.e. `group < live_group || live_pos == 127`). A partial group
+        // that is NOT the live group falls through both and the kernel reads zeros --
+        // silently wrong attention, worse than a crash.
+        //
+        // `live_group` on the read side is the numeric MAXIMUM of the indices the
+        // arena was handed (kvarn.cu:2149), so the virtual numbering
+        // (assign_virtual_slots()) is what makes this hold regardless of where KVMem
+        // physically parks the block. This check is the backstop: refuse to run rather
+        // than let attention read zeros for a group that is in neither the F16 stage
+        // nor a record.
+        uint32_t partial_id = ~0u;
+        int32_t  partial_slot = -1;
+        int32_t  max_slot = -1;
+        auto & st = runtime_->store();
+        for (const auto & b : st.blocks()) {
+            if (b.gpu_slot < 0 || b.n_tokens == 0) {
+                continue;
+            }
+            max_slot = std::max(max_slot, static_cast<int32_t>(virtual_slot_of(b.block_id)));
+            if (b.n_tokens < block_tokens_) {
+                partial_id = b.block_id;
+                partial_slot = static_cast<int32_t>(virtual_slot_of(b.block_id));
+            }
+        }
+        if (partial_id != ~0u && partial_slot != max_slot) {
+            LLAMA_LOG_ERROR("%s: partial block %u carries virtual slot %d but the highest "
+                    "is %d; KVarN would read that group from neither the F16 stage "
+                    "nor a record and silently attend to zeros\n",
+                    __func__, partial_id, partial_slot, max_slot);
+            GGML_ABORT("%s: partial block is not in the live slot", __func__);
+        }
     }
     pos_queue_.clear();
     for (const auto & ubatch : ubatches) {
@@ -1414,25 +2156,161 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
             break;
         }
 
-        return std::make_unique<llama_kv_cache_context>(
+        // With KVarN on, the base context must be built on the METADATA cache: the
+        // KVarN context forwards set_input_k_idxs()/set_input_v_idxs() to base(),
+        // and those are pure index bookkeeping. Wrapping it in the KVarN context is
+        // the only thing that makes llama-graph.cpp take the direct-attention route
+        // (it dynamic_casts this exact class).
+        //
+        // KVMem fills slot_info itself and leaves stage_slots empty. That is safe
+        // only because uses_compact_read_indices() is false here (unified +
+        // n_seq_max==1), so the arena never reads host-selected stage slots.
+        auto base = std::make_unique<llama_kv_cache_context>(
                 kv_, std::move(sinfos), std::move(ubatches));
+        if (kvarn_) {
+            GGML_ASSERT(!kvarn_->uses_compact_read_indices());
+            return std::make_unique<llama_kv_cache_kvarn_context>(kvarn_, std::move(base));
+        }
+        // KVarN off: a plain row cache, and a plain context is what the graph
+        // expects.
+        return base;
     } while (false);
 
+    if (kvarn_) {
+        return std::make_unique<llama_kv_cache_kvarn_context>(
+                kvarn_,
+                std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE));
+    }
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_full() {
+    if (kvarn_) {
+        return std::make_unique<llama_kv_cache_kvarn_context>(kvarn_, kvarn_->init_full());
+    }
     return kv_->init_full();
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_update(llama_context * lctx, bool optimize) {
+    // Record every context we are updated from: move_record_group() does not
+    // synchronise, so the slot layout pass has to llama_synchronize() on the
+    // context whose graph last touched the arena. process_ubatch() calls
+    // memory_update() -> init_update() before its init_batch loop, so this is
+    // always the freshest context by the time records move.
+    sync_ctx_ = lctx;
+    if (kvarn_) {
+        return std::make_unique<llama_kv_cache_kvarn_context>(
+                kvarn_, kvarn_->init_update(lctx, optimize), lctx);
+    }
     return kv_->init_update(lctx, optimize);
+}
+
+llama_memory_context_ptr llama_memory_kvmem::init_kv_batch(const std::vector<llama_ubatch> & ubatches) {
+    // Entry point used by the hybrid wrappers (llama_memory_hybrid::init_batch and
+    // friends): they split the ubatches themselves and then ask the ATTENTION
+    // memory to place them. This must run KVMem's own preparation -- not
+    // kvarn_->init_kv_batch(), which would hand the arena ubatches whose cells
+    // nobody placed, and not a bare inner prepare, which would skip
+    // assign_virtual_slots() and with it the virtual numbering that makes KVarN's
+    // live_group inference correct.
+    if (ubatches.empty()) {
+        // The stock memory answers an empty request with a null context; keep that
+        // contract instead of fabricating one.
+        return nullptr;
+    }
+
+    uint32_t n_new_tokens = 0;
+    for (const auto & ub : ubatches) {
+        n_new_tokens += ub.n_tokens;
+    }
+
+    llama_kv_cache::slot_info_vec_t sinfos;
+    if (!prepare_ubatches(ubatches, n_new_tokens, sinfos)) {
+        LLAMA_LOG_ERROR("%s: failed to prepare KVMem attention ubatches\n", __func__);
+        // null means "prepare failed" to the hybrid base class.
+        return nullptr;
+    }
+
+    // The caller still needs `ubatches` (llama_memory_hybrid_context builds the
+    // recurrent context from them), so the attention context copies the vector
+    // rather than taking it over. Same wrapping rule as init_batch(): under KVarN
+    // the context must be the KVarN one or the graph never takes the direct
+    // record-attention route.
+    auto base = std::make_unique<llama_kv_cache_context>(kv_, std::move(sinfos), ubatches);
+    if (kvarn_) {
+        GGML_ASSERT(!kvarn_->uses_compact_read_indices());
+        return std::make_unique<llama_kv_cache_kvarn_context>(kvarn_, std::move(base));
+    }
+    return base;
+}
+
+uint32_t llama_memory_kvmem::get_kv_n_stream() const {
+    return kvarn_ ? kvarn_->get_kv_n_stream() : 1;
+}
+
+uint32_t llama_memory_kvmem::get_kv_size() const {
+    return kvarn_ ? kvarn_->get_kv_size() : kv_size_;
+}
+
+llama_memory_i::seq_rm_capability llama_memory_kvmem::get_seq_rm_capability() const {
+    if (kvarn_) {
+        // KVarN's own capability: full clear, and a suffix rollback clamped to
+        // one record group. Claiming the beellama default (arbitrary ranges +
+        // unbounded rollback) would let callers plan removals the arena rejects.
+        return kvarn_->get_seq_rm_capability();
+    }
+    return llama_memory_i::get_seq_rm_capability();
+}
+
+// Precision-tail forwarding. The tail belongs to the inner cache (the KVarN arena
+// when we own one, otherwise the borrowed stock llama_kv_cache of the hybrid
+// path). Inheriting llama_memory_i's defaults here silently disables the tail and,
+// worse, makes llama_context throw at startup as soon as a tail is requested.
+ggml_type llama_memory_kvmem::get_kv_tail_type() const {
+    if (kvarn_) {
+        return kvarn_->get_kv_tail_type();
+    }
+    return kv_ ? kv_->get_kv_tail_type() : GGML_TYPE_COUNT;
+}
+
+uint32_t llama_memory_kvmem::get_kv_tail_group_count() const {
+    if (kvarn_) {
+        return kvarn_->get_kv_tail_group_count();
+    }
+    return kv_ ? kv_->get_kv_tail_group_count() : 0;
+}
+
+bool llama_memory_kvmem::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    if (kvarn_) {
+        return kvarn_->get_kv_tail_coverage(group_index, seq_id, out);
+    }
+    return kv_ ? kv_->get_kv_tail_coverage(group_index, seq_id, out) : false;
+}
+
+void llama_memory_kvmem::reset_kv_tail_planner_timing() {
+    if (kvarn_) {
+        kvarn_->reset_kv_tail_planner_timing();
+    } else if (kv_) {
+        kv_->reset_kv_tail_planner_timing();
+    }
+}
+
+uint64_t llama_memory_kvmem::get_kv_tail_planner_timing_ns() const {
+    if (kvarn_) {
+        return kvarn_->get_kv_tail_planner_timing_ns();
+    }
+    return kv_ ? kv_->get_kv_tail_planner_timing_ns() : 0;
 }
 
 void llama_memory_kvmem::clear(bool data) {
     harvest_flush();
     harvest_gpu_v_commit();
-    if (kv_) {
+    if (kvarn_) {
+        // Must go through the arena: clearing only the metadata cells would
+        // leave stale records behind for the next block that reuses a slot.
+        kvarn_->clear(data);
+    } else if (kv_) {
         kv_->clear(data);
     }
     reset_policy();
@@ -1440,7 +2318,11 @@ void llama_memory_kvmem::clear(bool data) {
 
 bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     ++attention_epoch_;
-    const bool ok = kv_->seq_rm(seq_id, p0, p1);
+    // Route through the arena (when we own one) so the record bookkeeping and
+    // the cell bookkeeping stay in step. The metadata cache alone would drop
+    // cells while leaving their records live and readable.
+    const bool ok = kvarn_ ? kvarn_->seq_rm(seq_id, p0, p1)
+                           : kv_->seq_rm(seq_id, p0, p1);
     if (!ok) {
         return false;
     }
@@ -1458,42 +2340,117 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
 
 void llama_memory_kvmem::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     ++attention_epoch_;
-    kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    (kvarn_ ? kvarn_->seq_cp(seq_id_src, seq_id_dst, p0, p1)
+            : kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1));
 }
 
 void llama_memory_kvmem::seq_keep(llama_seq_id seq_id) {
     ++attention_epoch_;
-    kv_->seq_keep(seq_id);
+    if (kvarn_) {
+        kvarn_->seq_keep(seq_id);
+    } else {
+        kv_->seq_keep(seq_id);
+    }
 }
 
 void llama_memory_kvmem::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     ++attention_epoch_;
-    kv_->seq_add(seq_id, p0, p1, shift);
+    if (kvarn_) {
+        kvarn_->seq_add(seq_id, p0, p1, shift);
+    } else {
+        kv_->seq_add(seq_id, p0, p1, shift);
+    }
 }
 
 void llama_memory_kvmem::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     ++attention_epoch_;
-    kv_->seq_div(seq_id, p0, p1, d);
+    if (kvarn_) {
+        kvarn_->seq_div(seq_id, p0, p1, d);
+    } else {
+        kv_->seq_div(seq_id, p0, p1, d);
+    }
+}
+
+bool llama_memory_kvmem::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    ++attention_epoch_;
+    // Cells live in the metadata cache; the arena delegates seq_rm_cell there
+    // too, but going through it keeps any record-side notification in the loop.
+    return kvarn_ ? kvarn_->seq_rm_cell(seq_id, cell_idx)
+                  : kv_->seq_rm_cell(seq_id, cell_idx);
+}
+
+int llama_memory_kvmem::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    if (seq_id < 0) {
+        return 0;
+    }
+    // a row is identified by its logical (original) position when it has one,
+    // which is why this does not delegate to the inner cache
+    const llama_kv_cells & cells = kv_->get_cells(seq_id);
+    int n_found = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const auto logical = cells.ext_get(i).logical_pos;
+        const auto p = logical >= 0 ? logical : cells.pos_get(i);
+        if (p != pos) {
+            continue;
+        }
+        if (cell_indices && n_found < n_max) {
+            cell_indices[n_found] = i;
+        }
+        ++n_found;
+    }
+    return n_found;
 }
 
 llama_pos llama_memory_kvmem::seq_pos_min(llama_seq_id seq_id) const {
-    return kv_->seq_pos_min(seq_id);
+    return kvarn_ ? kvarn_->seq_pos_min(seq_id) : kv_->seq_pos_min(seq_id);
 }
 
 llama_pos llama_memory_kvmem::seq_pos_max(llama_seq_id seq_id) const {
-    return kv_->seq_pos_max(seq_id);
+    return kvarn_ ? kvarn_->seq_pos_max(seq_id) : kv_->seq_pos_max(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdown() const {
-    return kv_->memory_breakdown();
+    if (!kvarn_) {
+        return kv_->memory_breakdown();
+    }
+    // KVarN's own memory_breakdown() only walks the arena's buffers (records,
+    // F16 stages, tails) and never the metadata cache's cells/pos buffers, which
+    // the arena owns but does not own the accounting for. Report both halves so
+    // KVMem's number is the real one; dropping the metadata side would hide a
+    // per-layer buffer type from the context's VRAM report.
+    std::map<ggml_backend_buffer_type_t, size_t> result = kvarn_->memory_breakdown();
+    for (const auto & [buft, size] : kvarn_->get_metadata_cache()->memory_breakdown()) {
+        result[buft] += size;
+    }
+    return result;
+}
+
+llama_kv_memory_stats llama_memory_kvmem::kv_memory_stats() const {
+    // llama_memory_i's default is all zeros. llama_memory_hybrid forwards this to
+    // its attention half, so without an override the hybrid would report an empty
+    // cache where the stock row cache used to report real numbers.
+    return kv_ ? kv_->kv_memory_stats() : llama_kv_memory_stats{};
 }
 
 void llama_memory_kvmem::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (kvarn_) {
+        // The arena is what serialises the records; checkpointing only the
+        // metadata cache would emit cells whose records are not in the stream.
+        kvarn_->state_write(io, seq_id, flags);
+        return;
+    }
     kv_->state_write(io, seq_id, flags);
 }
 
 void llama_memory_kvmem::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ++attention_epoch_;
+    if (kvarn_) {
+        kvarn_->state_read(io, seq_id, flags);
+        return;
+    }
     kv_->state_read(io, seq_id, flags);
 }
 
@@ -1508,9 +2465,11 @@ void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
     pending_capture_.push_back({t, il, which});
     if (which == 'q') {
         graph_has_q_ = true;
+        retr_reg_q_++;
     }
     if (which == 'k') {
         graph_has_k_ = true;
+        retr_reg_k_++;
     }
 }
 
@@ -2154,6 +3113,7 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
         }
         if (!flat.empty()) {
             raw_->write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
+            retr_write_k_++;
         }
     } else if (which == 'q') {
         std::vector<float> flat;
@@ -2170,6 +3130,7 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
                 dst[d0] += src[d0];
             }
             q_count_[static_cast<uint32_t>(il)]++;
+            retr_write_q_++;
         }
     }
 }
@@ -2194,6 +3155,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
 
     if (which == 'k') {
         raw_->write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
+        retr_write_k_++;
         static bool dumped = false;
         if (!dumped && getenv("KVMEM_DUMP_CAPTURE") && il == 0) {
             dumped = true;
@@ -2217,6 +3179,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
                 dst[d] += src[d];
             }
             q_count_[static_cast<uint32_t>(il)]++;
+            retr_write_q_++;
         }
     }
 }
@@ -2317,6 +3280,9 @@ void llama_memory_kvmem::harvest_gpu_v_commit() {
 }
 
 void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
+    // Stage-out to host/NVMe would read V rows that the arena does not expose as
+    // rows. Batch 4 ports this through record materialisation.
+    kvmem_kvarn_row_path_fail_closed(kvarn_, "stage-out (harvest_gpu_v)");
     if (v_trans_ || !raw_ || !kv_) {
         return;
     }
@@ -2417,6 +3383,33 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
 }
 
 void llama_memory_kvmem::harvest_full_blocks_async() {
+    if (kvarn_) {
+        // Under KVarN "harvesting a block" means snapshotting its record bytes,
+        // not copying K/V rows. Do that for every GPU-resident full block that
+        // has no host copy yet, so a later eviction can always restore it.
+        // (The row path below cannot run here: its density probe goes through
+        // kvmem_cache_has_layer(), which is always false on the arena.)
+        auto & st = runtime_->store();
+        const uint64_t want = record_bytes_per_block();
+        if (want == 0) {
+            return;
+        }
+        for (const auto & b : st.blocks()) {
+            if (b.gpu_slot < 0) {
+                continue;
+            }
+            // Snapshot every resident block, including partial ones: a partial or
+            // sink-slot block is not snapshotable, and running it through here is
+            // what records that fact in rec_pinned_ so apply_plan_to_kv() leaves
+            // it alone.
+            auto it = rec_host_.find(b.block_id);
+            if (it != rec_host_.end() && it->second.size() == static_cast<size_t>(want)) {
+                continue;
+            }
+            snapshot_records(b.block_id);
+        }
+        return;
+    }
     if (retrieval_pinned_ || replay_ || v_trans_ || !raw_ || !kv_ || !runtime_) {
         return;
     }
@@ -2674,7 +3667,12 @@ void llama_memory_kvmem::decode_mean_flush() {
     uint32_t n_host = 0;
     float rms = 0.0f;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        // Layer-existence test, not a row access: the data below comes from the
+        // capture hooks (decode_mean_host_ / the GPU mean-K acc), never from the
+        // row cache. Using the row predicate here skipped EVERY layer under KVarN
+        // (the metadata cache holds no layers), so the running decode mean was
+        // silently never flushed. See kvmem_layer_has_kv().
+        if (!kvmem_layer_has_kv(static_cast<int32_t>(il))) {
             continue;
         }
         const uint8_t src = (il < decode_mean_src_.size()) ? decode_mean_src_[il] : 0;
@@ -2724,13 +3722,193 @@ void llama_memory_kvmem::decode_mean_flush() {
     }
 }
 
+// ---- KVarN record round-trip -------------------------------------------------
+//
+// A block's GPU residency under KVarN IS its record group, and a record's bytes
+// depend only on the token values, the head slice and the bit width -- never on
+// which slot holds it (llama-kvarn.cpp:838-895 has no cell/position parameter).
+// KVMem only ever moves physical slots and never rewrites logical positions, so a
+// block leaves the GPU by copying its record bytes to host and returns by copying
+// them back in. No store operator, no F16 source and no domain conversion needed.
+//
+// What this replaces: the old row-wise path copied packed K/V rows through
+// get_k_storage()/get_v_storage() and rebuilt the cache with the stage-in
+// transcode pipeline. Under KVarN those storage tensors do not exist (the arena's
+// metadata cache rejects every layer id), so the row path could only ever skip
+// every layer and report success -- exactly the silent failure the design forbids.
+
+uint64_t llama_memory_kvmem::record_bytes_per_block() const {
+    if (!kvarn_) {
+        return 0;
+    }
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        const ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
+        const ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
+        if (!kt || !vt) {
+            continue;
+        }
+        // One KVMem block == one record group, and a group is exactly nb[2]
+        // contiguous bytes (proved on real hardware in batch 1).
+        total += static_cast<uint64_t>(kt->nb[2]) + static_cast<uint64_t>(vt->nb[2]);
+    }
+    return total;
+}
+
+bool llama_memory_kvmem::block_records_snapshotable(uint32_t block_id) const {
+    if (!kvarn_ || block_id >= runtime_->store().block_count()) {
+        return false;
+    }
+    const kvmem::KvMemBlock & blk = runtime_->store().blocks()[block_id];
+    if (blk.gpu_slot < 0 || blk.n_tokens == 0) {
+        return false;
+    }
+    if (blk.gpu_slot == 0) {
+        // KVarN's permanent sink group: never sealed as a record (the store
+        // kernel skips group 0), always read from the F16 stage. Its record bytes
+        // belong to whatever group last used the slot, so copying them out and
+        // back would corrupt the block silently.
+        return false;
+    }
+    if (blk.n_tokens < block_tokens_) {
+        // An incomplete group is never sealed either: the kernel only commits a
+        // record once the group's last position arrives. Attention already reads
+        // this group from the F16 stage, so the record bytes are not the
+        // authority. Snapshotting them and restoring them later would look like
+        // success while the read side kept using a stage row that no longer holds
+        // this block.
+        return false;
+    }
+    return true;
+}
+
+void llama_memory_kvmem::snapshot_records(uint32_t block_id) {
+    if (!kvarn_ || block_id >= runtime_->store().block_count()) {
+        return;
+    }
+    const kvmem::KvMemBlock & blk = runtime_->store().blocks()[block_id];
+    if (blk.gpu_slot < 0) {
+        return;
+    }
+    if (!block_records_snapshotable(block_id)) {
+        // Remember the decision: apply_plan_to_kv() must not evict this block,
+        // because there is no way to bring it back.
+        if (rec_pinned_.size() <= block_id) {
+            rec_pinned_.resize(block_id + 1, 0);
+        }
+        rec_pinned_[block_id] = 1;
+        return;
+    }
+    const uint64_t total = record_bytes_per_block();
+    if (total == 0) {
+        return;
+    }
+    if (rec_pinned_.size() > block_id) {
+        rec_pinned_[block_id] = 0;
+    }
+    std::vector<uint8_t> & blob = rec_host_[block_id];
+    blob.assign(static_cast<size_t>(total), 0);
+    uint64_t off = 0;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
+        ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
+        if (!kt || !vt) {
+            continue;
+        }
+        const size_t kbytes = static_cast<size_t>(kt->nb[2]);
+        const size_t vbytes = static_cast<size_t>(vt->nb[2]);
+        kvmem_tensor_get(kt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * kbytes, kbytes);
+        off += kbytes;
+        kvmem_tensor_get(vt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * vbytes, vbytes);
+        off += vbytes;
+    }
+    if (trace_) {
+        fprintf(stderr, "KVMEM_TRACE record_snapshot block=%u slot=%d bytes=%llu\n",
+                block_id, blk.gpu_slot, (unsigned long long) total);
+    }
+}
+
+bool llama_memory_kvmem::restore_records(uint32_t block_id) {
+    if (!kvarn_ || block_id >= runtime_->store().block_count()) {
+        return false;
+    }
+    const kvmem::KvMemBlock & blk = runtime_->store().blocks()[block_id];
+    if (blk.gpu_slot < 0) {
+        return false;
+    }
+    auto it = rec_host_.find(block_id);
+    const uint64_t total = record_bytes_per_block();
+    if (it == rec_host_.end() || total == 0 ||
+        it->second.size() != static_cast<size_t>(total)) {
+        return false;
+    }
+    const std::vector<uint8_t> & blob = it->second;
+    uint64_t off = 0;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
+        ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
+        if (!kt || !vt) {
+            continue;
+        }
+        const size_t kbytes = static_cast<size_t>(kt->nb[2]);
+        const size_t vbytes = static_cast<size_t>(vt->nb[2]);
+        kvmem_tensor_set(kt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * kbytes, kbytes);
+        off += kbytes;
+        kvmem_tensor_set(vt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * vbytes, vbytes);
+        off += vbytes;
+    }
+    return true;
+}
+
 void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     auto & store = runtime_->store();
     if (block_id >= store.block_count()) {
         return;
     }
     const kvmem::KvMemBlock & blk = store.blocks()[block_id];
-    if (blk.gpu_slot < 0 || !raw_->has_block(block_id)) {
+    if (blk.gpu_slot < 0) {
+        return;
+    }
+
+    if (kvarn_) {
+        // A block can only be in the arena because the prefill graph sealed its
+        // records there, or because we just copied a host snapshot back in.
+        // There is no third route: KVarN has no row-wise write path, and the
+        // pre-RoPE q8 rows in RawKvStore are not the same representation as a
+        // sealed record (post-RoPE K in the Hadamard domain).
+        if (!restore_records(block_id)) {
+            if (block_records_snapshotable(block_id)) {
+                // A full block in a non-sink slot that has no host copy means the
+                // eviction that freed this block never snapshotted it. Restoring
+                // nothing would leave the slot holding another block's records,
+                // and attention would read them -- the silent reinterpretation the
+                // design forbids. This is a real bug, not a configuration choice.
+                LLAMA_LOG_ERROR("%s: full block %u has no host record snapshot to restore "
+                        "(slot %d); refusing to let it read another block's records\n",
+                        __func__, block_id, blk.gpu_slot);
+                GGML_ABORT("%s: missing host record snapshot for block %u", __func__, block_id);
+            }
+            // Sink-slot and partial blocks legitimately have no snapshot: their
+            // data lives in the F16 stage and is read from there. They must never
+            // have been evicted -- apply_plan_to_kv() keeps them resident -- so
+            // there is nothing to restore and the cells are already in place.
+            if (trace_) {
+                fprintf(stderr, "KVMEM_TRACE stage_in_record_skip block=%u slot=%d n=%u "
+                        "(stage-backed)\n", block_id, blk.gpu_slot, blk.n_tokens);
+            }
+            return;
+        }
+        ++attention_epoch_;
+        occupy_block_cells(block_id);
+        if (trace_) {
+            fprintf(stderr, "KVMEM_TRACE stage_in_record block=%u slot=%d n=%u orig=%u\n",
+                    block_id, blk.gpu_slot, blk.n_tokens, blk.orig_pos_start);
+        }
+        return;
+    }
+
+    // ---- stock row-shaped cache: unchanged ----
+    if (!raw_->has_block(block_id)) {
         return;
     }
     ++attention_epoch_;
@@ -2785,15 +3963,44 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
             write_packed(vt, vbase, vpack.data(), vrow, vrow * (size_t) nt);
         }
     }
-    if (trace_) {
-        kvmem_diag("KVMEM_TRACE stage_in_packed block=%u slot=%d n=%u orig=%u\n",
-                block_id, blk.gpu_slot, nt, blk.orig_pos_start);
-    }
 }
 
 void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_slot,
                                                 void * host, uint64_t bytes) {
-    if (!host || !kv_ || gpu_slot < 0 || bytes == 0) {
+    if (!host || gpu_slot < 0 || bytes == 0) {
+        return;
+    }
+    if (kvarn_) {
+        // Host copies of a block are record bytes, so this is a straight
+        // per-layer group copy. `bytes` must equal record_bytes_per_block(); the
+        // CPU/NVMe tiers size their slots from the same number, so a mismatch
+        // would mean one of the two was computed for the wrong storage format.
+        const uint64_t total = record_bytes_per_block();
+        if (bytes < total) {
+            LLAMA_LOG_ERROR("%s: host slot is %llu bytes but the record groups need %llu\n",
+                    __func__, (unsigned long long) bytes, (unsigned long long) total);
+            GGML_ABORT("%s: host record slot is too small", __func__);
+        }
+        auto * dst = static_cast<uint8_t *>(host);
+        uint64_t off = 0;
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
+            ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
+            if (!kt || !vt) {
+                continue;
+            }
+            const size_t kbytes = static_cast<size_t>(kt->nb[2]);
+            const size_t vbytes = static_cast<size_t>(vt->nb[2]);
+            kvmem_tensor_get(kt, dst + off, static_cast<size_t>(gpu_slot) * kbytes, kbytes);
+            off += kbytes;
+            kvmem_tensor_get(vt, dst + off, static_cast<size_t>(gpu_slot) * vbytes, vbytes);
+            off += vbytes;
+        }
+        (void) block_id;
+        return;
+    }
+
+    if (!kv_ || bytes == 0) {
         return;
     }
     (void) block_id;
@@ -2831,7 +4038,35 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
 
 void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
                                                   const void * host, uint64_t bytes) {
-    if (!host || !kv_ || gpu_slot < 0 || bytes == 0) {
+    if (!host || gpu_slot < 0 || bytes == 0) {
+        return;
+    }
+    if (kvarn_) {
+        const uint64_t total = record_bytes_per_block();
+        if (bytes < total) {
+            LLAMA_LOG_ERROR("%s: host slot is %llu bytes but the record groups need %llu\n",
+                    __func__, (unsigned long long) bytes, (unsigned long long) total);
+            GGML_ABORT("%s: host record slot is too small", __func__);
+        }
+        const auto * src = static_cast<const uint8_t *>(host);
+        uint64_t off = 0;
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
+            ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
+            if (!kt || !vt) {
+                continue;
+            }
+            const size_t kbytes = static_cast<size_t>(kt->nb[2]);
+            const size_t vbytes = static_cast<size_t>(vt->nb[2]);
+            kvmem_tensor_set(kt, src + off, static_cast<size_t>(gpu_slot) * kbytes, kbytes);
+            off += kbytes;
+            kvmem_tensor_set(vt, src + off, static_cast<size_t>(gpu_slot) * vbytes, vbytes);
+            off += vbytes;
+        }
+        return;
+    }
+
+    if (!kv_ || bytes == 0) {
         return;
     }
     (void) block_id;
@@ -2867,16 +4102,42 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     }
 }
 
+
 void llama_memory_kvmem::score_retrieval() {
     auto & store = runtime_->store();
     const uint32_t nblk = store.block_count();
     std::vector<double> scores(nblk, 0.0);
     std::vector<float> mk(n_embd_k_, 0.0f);
     const uint32_t g = n_head_kv_ == 0 ? 1 : n_head_ / n_head_kv_;
+    // WHERE THE DATA COMES FROM (corrected -- an earlier version of this comment
+    // blamed KVarN for something that was never KVarN's fault):
+    //
+    //   raw_->has_block(b)  <- the mean-K ledger, written ONLY by
+    //                          write_layer_mean_k(), which is called from
+    //                          harvest_capture() / harvest_from_host() -- i.e. from
+    //                          the pre-RoPE K graph tensors that the capture hooks
+    //                          pinned.
+    //   q_count_ / q_sum_   <- the captured query tensors, same hooks.
+    //
+    // Neither one reads a K/V row, so neither is affected by the KVarN metadata
+    // cache's zero-layer filter. What DOES decide whether they are populated is the
+    // model file: llm_graph_context::kvmem_capture_{q,k} is called by exactly two
+    // arches today (src/models/qwen3.cpp:91,101 and src/models/qwen35.cpp:284,290).
+    // Measured on Hy-MT2-1.8B (Hunyuan -- no hooks): q_layers=0 and write_q=0 with
+    // KVarN both OFF and ON, so that model has no retrieval to lose. The old
+    // "KVarN ON: have_block=0 / KVarN OFF: have_block=1" reading compared an empty
+    // capture ledger against the row-based raw-K side table -- two different
+    // sources, only one of which the scorer can use.
+    //
+    // The real defect this function had was being SILENT: when the ledger is
+    // unusable every score stays 0, the selector returns recency, and nothing is
+    // logged. The counters below plus the KVMEM_RETRIEVAL summary make the state
+    // observable, and llama_kvmem_get_retrieval_stats() exposes it to tests.
     for (uint32_t b = 0; b < nblk; ++b) {
         if (!raw_->has_block(b)) {
             continue;
         }
+        retr_have_++;
         double acc = 0;
         uint32_t nlay = 0;
         for (uint32_t il = 0; il < n_layer_; ++il) {
@@ -2914,6 +4175,73 @@ void llama_memory_kvmem::score_retrieval() {
         scores[b] = nlay ? acc / nlay : 0;
     }
     store.set_retrieval_scores(scores);
+
+    // ---- health report ---------------------------------------------------------
+    retr_runs_++;
+    retr_blocks_ = nblk;
+    retr_resident_ = 0;
+    retr_q_layers_ = 0;
+    retr_scored_ = 0;
+    retr_max_score_ = 0.0f;
+    for (const auto & blk : store.blocks()) {
+        if (blk.gpu_slot >= 0) {
+            retr_resident_++;
+        }
+    }
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (q_count_[il] != 0) {
+            retr_q_layers_++;
+        }
+    }
+    for (uint32_t b = 0; b < nblk; ++b) {
+        const float s = static_cast<float>(scores[b]);
+        if (s != 0.0f) {
+            retr_scored_++;
+        }
+        if (std::fabs(s) > retr_max_score_) {
+            retr_max_score_ = std::fabs(s);
+        }
+    }
+
+    fprintf(stderr,
+            "KVMEM_RETRIEVAL runs=%u blocks=%u resident=%u have_block=%u q_layers=%u "
+            "scored=%u max=%.6f reg_k=%llu reg_q=%llu write_k=%llu write_q=%llu\n",
+            retr_runs_, retr_blocks_, retr_resident_, retr_have_, retr_q_layers_,
+            retr_scored_, retr_max_score_,
+            (unsigned long long) retr_reg_k_, (unsigned long long) retr_reg_q_,
+            (unsigned long long) retr_write_k_, (unsigned long long) retr_write_q_);
+
+    // Score 0 for every block is not a legitimate outcome of retrieval: it means
+    // the selector will hand back a recency window while the caller believes it
+    // got a retrieval. Say so, loudly, once per context.
+    const char * reason = nullptr;
+    if (nblk > 0) {
+        if (retr_reg_k_ == 0 && retr_reg_q_ == 0) {
+            reason = "no-capture-hooks";
+        } else if (retr_have_ == 0) {
+            reason = "no-mean-k";
+        } else if (retr_q_layers_ == 0) {
+            reason = "no-query";
+        } else if (retr_scored_ == 0) {
+            reason = "all-zero-scores";
+        }
+    }
+    if (reason && !retr_warned_) {
+        retr_warned_ = true;
+        fprintf(stderr,
+                "KVMEM_RETRIEVAL_DEGRADED reason=%s blocks=%u have_block=%u q_layers=%u "
+                "scored=%u reg_k=%llu reg_q=%llu write_k=%llu write_q=%llu "
+                "-- retrieval produced no usable scores; the selection falls back to recency\n",
+                reason, retr_blocks_, retr_have_, retr_q_layers_, retr_scored_,
+                (unsigned long long) retr_reg_k_, (unsigned long long) retr_reg_q_,
+                (unsigned long long) retr_write_k_, (unsigned long long) retr_write_q_);
+        if (retr_reg_k_ == 0 && retr_reg_q_ == 0) {
+            fprintf(stderr,
+                    "KVMEM_RETRIEVAL_DEGRADED hint=the capture hooks are wired by "
+                    "src/models/qwen3.cpp and src/models/qwen35.cpp only; this arch never "
+                    "pins pre-RoPE K or Q, so there is no ledger to score\n");
+        }
+    }
 }
 
 void llama_memory_kvmem::retr_perf_print() {
@@ -3107,7 +4435,10 @@ bool llama_memory_kvmem::get_query(llama_kvmem_query_state & state) {
     bool any = false;
     uint32_t rows = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, il)) continue;
+        // q_sum_/q_count_ are pure capture-side state; the row predicate made this
+        // return false for every layer under KVarN, so the query summary could never
+        // be saved or restored. See kvmem_layer_has_kv().
+        if (!kvmem_layer_has_kv(static_cast<int32_t>(il))) continue;
         if (!q_count_[il] || (rows && rows != q_count_[il])) return false;
         rows = q_count_[il];
         any = true;
@@ -3125,7 +4456,7 @@ bool llama_memory_kvmem::set_query(const llama_kvmem_query_state & state) {
         const auto & v = state.sum[il];
         if (v.size() != n_head_ * n_embd_head_ ||
                 !std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); })) return false;
-        if (!kvmem_cache_has_layer(kv_, il)) continue;
+        if (!kvmem_layer_has_kv(static_cast<int32_t>(il))) continue;
         if (!state.count[il] || (rows && rows != state.count[il])) return false;
         rows = state.count[il];
     }
@@ -3322,6 +4653,10 @@ void llama_memory_kvmem::kv_stats(const char * tag, const float * a, const float
 
 bool llama_memory_kvmem::read_gpu_block(uint32_t block_id, uint32_t il, bool is_k,
                                         std::vector<float> & out) const {
+    // Batch 4 ports this by materialising the target record group
+    // (ggml_kvarn_materialize with read_indirect = 1); reading rows here would
+    // return nothing and silently score every block as a miss.
+    kvmem_kvarn_row_path_fail_closed(kvarn_, "mean-K read (read_gpu_block)");
     const auto & store = runtime_->store();
     if (block_id >= store.block_count() || il >= n_layer_ ||
         !kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
@@ -3366,6 +4701,9 @@ bool llama_memory_kvmem::read_gpu_block(uint32_t block_id, uint32_t il, bool is_
 }
 
 void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) {
+    // A KVarN dump must materialise record groups (read_indirect = 1); the row
+    // path would report mismatch=0 for a comparison that never happened.
+    kvmem_kvarn_row_path_fail_closed(kvarn_, "KV comparison dump (dump_kv_compare)");
     auto & store = runtime_->store();
     if (block_id < 0 && force_pos_ >= 0) {
         block_id = store.block_id_containing(static_cast<uint32_t>(force_pos_));
@@ -3745,7 +5083,8 @@ bool llama_kvmem_remove_logical(llama_context * ctx, llama_pos begin, llama_pos 
     if (mem) return mem->remove_logical(ctx, begin, end);
     auto * native = llama_get_memory(ctx);
     auto * hybrid = dynamic_cast<llama_memory_hybrid *>(native);
-    auto * kv = hybrid ? hybrid->get_mem_attn() : dynamic_cast<llama_kv_cache *>(native);
+    auto * kv = hybrid ? dynamic_cast<llama_kv_cache *>(hybrid->get_mem_attn())
+                       : dynamic_cast<llama_kv_cache *>(native);
     if (!kv) return llama_memory_seq_rm(native, 0, begin, end);
     if (hybrid && end < 0) {
         const auto & cells = kv->get_cells(0);
@@ -3781,4 +5120,16 @@ void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state) {
 
 void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state) {
     if (auto * mem = kvmem_capture_active()) mem->raw().restore_mean_checkpoint(row, state);
+}
+
+// Retrieval health for tests and for the server. Returns the last
+// score_retrieval() reading plus the capture-pipe counters, so a caller can tell
+// "this arch never captures" (no_capture_hooks) apart from "capture ran but the
+// ledger is empty" -- the two states that both used to look like a working
+// retrieval that silently scored nothing.
+llama_kvmem_retrieval_stats llama_kvmem_get_retrieval_stats() {
+    if (auto * mem = kvmem_capture_active()) {
+        return mem->retrieval_stats();
+    }
+    return {};
 }

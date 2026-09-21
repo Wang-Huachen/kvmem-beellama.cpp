@@ -28,13 +28,54 @@ struct kvmem_spec_opts {
     ggml_type type_k = GGML_TYPE_Q8_0;
     ggml_type type_v = GGML_TYPE_Q8_0;
     ggml_type draft_type = GGML_TYPE_COUNT; // inherit target K/V types unless overridden
+    // KVarN record-arena intent (beellama's K/V cache format). DISABLED keeps the
+    // plain ggml row cache, i.e. the behaviour before this option existed.
+    //
+    // Target and MTP draft carry SEPARATE intent on purpose: beellama audits the
+    // draft route per architecture (llama-kvarn.cpp llama_kvarn_context_route_for;
+    // QWEN35/QWEN35MOE/QWEN4EXP are draft-owned), so one half may be KVarN while
+    // the other stays on rows.
+    llama_kvarn_params kvarn = {};
+    llama_kvarn_params draft_kvarn = {};
 };
 
 // Supported cache types: f16, f32, q8_0, q5_0, q4_0.
 // q5_0 requires GGML_CUDA_FA_ALL_QUANTS (enabled by this project's build).
 ggml_type kvmem_parse_cache_type(const char * s, bool * ok);
 // Quantized K/V may independently use q8_0, q5_0 or q4_0; no float/quantized mixing.
+// With KVarN on, type_k/type_v are unused (the record arena owns the bytes), so
+// callers must skip this check in that case.
 bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v);
+
+// Parses beellama's KVarN cache names ("kvarn2".."kvarn8" and the canonical
+// "kvarn_k4v4_g128" spelling) plus an explicit "off"/"none"/"disabled".
+// Returns true when the string denotes a KVarN request (including an explicit
+// off), and false when it is not a KVarN name at all, so that the ordinary ggml
+// type table can handle it.
+//
+// NOTE: llama_kvarn_type_from_name() returns LLAMA_KVARN_TYPE_INVALID (-1) for
+// unknown names, NOT DISABLED (0); the helper normalises INVALID -> DISABLED.
+bool kvmem_parse_kvarn(const char * s, llama_kvarn_params * out);
+
+// Resolves the KVarN K/V pair the way the cache actually supports it.
+//
+//   bits_k/bits_v   : KVarN bit width on each side (0 = no KVarN named there)
+//   plain_k/plain_v : the caller saw an EXPLICIT plain ggml type on that side
+//
+// ASYMMETRIC WIDTHS ARE SUPPORTED. llama.h spells out all 36 ordered pairs
+// (LLAMA_KVARN_K4V2_G128, K6V2, K2V8, ...), so "kvarn4 on K, kvarn2 on V" is a
+// first-class cache format and the two sides must be COMBINED, never silently
+// collapsed onto one width. beellama does the same (common/arg.cpp:1436-1473,
+// common_kvarn_pair_normalize).
+//
+// A KVarN / plain-type MIX is NOT supported: the record arena stores K and V
+// together, so one side cannot stay in ggml rows. beellama warns and upgrades the
+// plain side; this helper refuses instead, because silently changing a type the
+// user spelled out is exactly the surprise this project's rules forbid.
+//
+// Returns false and sets `err` to a static message when the pair is unsupported.
+bool kvmem_kvarn_pair(int32_t bits_k, int32_t bits_v, bool plain_k, bool plain_v,
+                      llama_kvarn_params * out, const char ** err);
 
 struct kvmem_spec_session {
     common_params spec_params;

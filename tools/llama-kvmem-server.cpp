@@ -233,6 +233,19 @@ struct ServerState {
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
     ggml_type spec_cache_type = GGML_TYPE_F16;
+    // KVarN record-arena intent (beellama's K/V cache format). DISABLED = plain ggml
+    // rows, i.e. the behaviour before this option existed. The target and the MTP
+    // draft carry separate intent because beellama audits the draft route per
+    // architecture (llama_kvarn_context_route_for: QWEN35/QWEN35MOE/QWEN4EXP owned).
+    llama_kvarn_params kvarn = llama_kvarn_default_params();
+    llama_kvarn_params draft_kvarn = llama_kvarn_default_params();
+    // Asymmetric K/V widths are a first-class format, so each side is tracked
+    // separately and combined once the whole command line is known (a KVarN/plain
+    // mix is refused by kvmem_kvarn_pair()).
+    int32_t kvarn_bits_k = 0;
+    int32_t kvarn_bits_v = 0;
+    bool    plain_k = false;
+    bool    plain_v = false;
     bool spec_mtp = false;
     int spec_n_max = 3;
     float spec_p_min = 0.0f;
@@ -342,7 +355,13 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
     llama_pos draft_rows = n_past;
     if (st.spec.ok) {
         common_speculative_get_state(st.spec.spec, 0, carry);
-        if (carry.size() >= sizeof(draft_rows)) std::memcpy(&draft_rows, carry.data(), sizeof(draft_rows));
+        // the blob is enveloped (see common/speculative.h) - read the payload
+        // through the accessor instead of assuming a payload offset
+        size_t payload_size = 0;
+        const uint8_t * payload = common_speculative_state_payload(0, carry, payload_size);
+        if (payload != nullptr && payload_size >= sizeof(draft_rows)) {
+            std::memcpy(&draft_rows, payload, sizeof(draft_rows));
+        }
     }
     if (rmax == want && draft_rows == n_past) return true;
     const std::vector<uint8_t> * saved_carry = nullptr;
@@ -375,7 +394,10 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
     const int from = ckpt_pos + 1;
     if (st.spec.ok) {
         if (!saved_carry || saved_carry->empty()) return false;
-        common_speculative_set_state(st.spec.spec, 0, *saved_carry);
+        if (!common_speculative_set_state(st.spec.spec, 0, *saved_carry)) {
+            kvmem_diag("KVMEM_TRACE gdn_sync set_state rejected\n");
+            return false;
+        }
         if (!llama_kvmem_remove_logical(st.spec.ctx_dft, from, -1)) return false;
     }
     if (from < n_past) {
@@ -430,10 +452,12 @@ static void memory_clear_all(ServerState & st) {
     st.gdn_carry.clear();
     st.gdn_query_carry.clear();
     if (st.spec.ok) {
-        std::vector<uint8_t> carry;
-        common_speculative_get_state(st.spec.spec, 0, carry);
-        std::fill(carry.begin(), carry.end(), 0);
-        common_speculative_set_state(st.spec.spec, 0, carry);
+        // an empty blob is the reset: it clears the state of every implementation.
+        // zeroing the bytes of a saved blob instead breaks the envelope checksum.
+        const std::vector<uint8_t> empty;
+        if (!common_speculative_set_state(st.spec.spec, 0, empty)) {
+            kvmem_diag("KVMEM_TRACE gdn_reset set_state rejected\n");
+        }
     }
     st.gdn_ckpt_pos = -1;
     st.gdn_ckpt_query.clear();
@@ -1703,28 +1727,65 @@ int main(int argc, char ** argv) {
             st.kparams.raw_k_nvme = true;
         } else if (eq(arg, "--kv-dtype") || eq(arg, "-ctk") || eq(arg, "--cache-type-k")
                    || eq(arg, "-ctv") || eq(arg, "--cache-type-v")) {
-            bool ok = false;
-            const ggml_type t = kvmem_parse_cache_type(need(arg), &ok);
-            if (!ok) {
-                fprintf(stderr, "unsupported cache type (want f16|f32|q8_0|q5_0|q4_0)\n");
-                return 1;
-            }
-            if (eq(arg, "-ctv") || eq(arg, "--cache-type-v")) {
-                st.cache_type_v = t;
-            } else if (eq(arg, "-ctk") || eq(arg, "--cache-type-k")) {
-                st.cache_type_k = t;
+            const char * v = need(arg);
+            const bool is_v = eq(arg, "-ctv") || eq(arg, "--cache-type-v");
+            const bool both = !is_v && !eq(arg, "-ctk") && !eq(arg, "--cache-type-k");
+            llama_kvarn_params kv;
+            if (kvmem_parse_kvarn(v, &kv)) {
+                // KVarN is a cache TYPE, not a switch ("-ctk kvarn6"). Record the width
+                // for this side only; kvmem_kvarn_pair() combines the two sides once
+                // every argument has been seen.
+                const int32_t bits = kv.type == LLAMA_KVARN_TYPE_DISABLED ? 0 : kv.key_bits;
+                if (is_v) {
+                    st.kvarn_bits_v = bits;
+                    config_sources["--cache-type-v"] = argument_source;
+                } else {
+                    st.kvarn_bits_k = bits;
+                    config_sources["--cache-type-k"] = argument_source;
+                    if (both) {
+                        st.kvarn_bits_v = bits; // --kv-dtype names K and V together
+                        config_sources["--cache-type-v"] = argument_source;
+                    }
+                }
             } else {
-                st.cache_type_k = t;
-                st.cache_type_v = t;
-                config_sources["--cache-type-k"] = argument_source;
-                config_sources["--cache-type-v"] = argument_source;
+                bool ok = false;
+                const ggml_type t = kvmem_parse_cache_type(v, &ok);
+                if (!ok) {
+                    fprintf(stderr, "unsupported cache type %s (want f16|f32|q8_0|q5_0|q4_0, "
+                            "or a KVarN type: kvarn2|kvarn3|kvarn4|kvarn5|kvarn6|kvarn8)\n", v);
+                    return 1;
+                }
+                if (is_v) {
+                    st.cache_type_v = t;
+                    st.plain_v = true;
+                } else if (eq(arg, "-ctk") || eq(arg, "--cache-type-k")) {
+                    st.cache_type_k = t;
+                    st.plain_k = true;
+                } else {
+                    st.cache_type_k = t;
+                    st.cache_type_v = t;
+                    st.plain_k = true;
+                    st.plain_v = true;
+                    config_sources["--cache-type-k"] = argument_source;
+                    config_sources["--cache-type-v"] = argument_source;
+                }
             }
-        } else if (eq(arg, "--spec-kv-dtype")) {
-            bool ok = false;
-            st.spec_cache_type = kvmem_parse_cache_type(need(arg), &ok);
-            if (!ok) {
-                fprintf(stderr, "unsupported MTP cache type (want f16|q8_0|q5_0|q4_0|f32)\n");
-                return 1;
+        } else if (eq(arg, "--spec-kv-dtype") || eq(arg, "--spec-draft-type-k")
+                   || eq(arg, "--spec-draft-type-v")) {
+            const char * v = need(arg);
+            llama_kvarn_params kv;
+            if (kvmem_parse_kvarn(v, &kv)) {
+                // The draft side keeps its own intent: beellama audits the draft route
+                // per architecture, and QWEN35/QWEN35MOE/QWEN4EXP own their cache.
+                st.draft_kvarn = kv;
+            } else {
+                bool ok = false;
+                st.spec_cache_type = kvmem_parse_cache_type(v, &ok);
+                if (!ok) {
+                    fprintf(stderr, "unsupported MTP cache type %s (want f16|q8_0|q5_0|q4_0|f32, "
+                            "or a KVarN type: kvarn2|kvarn3|kvarn4|kvarn5|kvarn6|kvarn8)\n", v);
+                    return 1;
+                }
             }
         } else if (eq(arg, "--spec-type")) {
             const char * t = need(arg);
@@ -1816,7 +1877,10 @@ int main(int argc, char ** argv) {
     }
 #endif
     // Validate before backend initialization and loading a potentially large model.
-    if (!kvmem_cache_types_ok(st.cache_type_k, st.cache_type_v)) {
+    // Skipped when a KVarN type was named: the record arena owns the K/V bytes, so
+    // type_k/type_v are unused and an asymmetric pair must not fail here.
+    if (st.kvarn_bits_k == 0 && st.kvarn_bits_v == 0 &&
+            !kvmem_cache_types_ok(st.cache_type_k, st.cache_type_v)) {
         fprintf(stderr, "incompatible KV cache types: K=%s, V=%s; quantized K/V must both use q8_0, q5_0 or q4_0; "
                 "set both -ctk and -ctv, or use --kv-dtype TYPE to set both\n",
                 ggml_type_name(st.cache_type_k), ggml_type_name(st.cache_type_v));
@@ -1871,6 +1935,14 @@ int main(int argc, char ** argv) {
     if (st.kparams.enabled) {
         if (!nvme_dir.empty()) {
             st.kparams.nvme_dir = nvme_dir.c_str();
+        }
+        if ((st.kvarn_bits_k || st.kvarn_bits_v) && st.kparams.block_tokens != 128) {
+            // The arena stores one record per KVAR_N_GROUP (128) cells and KVMem makes
+            // one block equal one record group, so any other granularity stops the pool
+            // geometry from matching the record layout.
+            fprintf(stderr, "note: KVarN needs --kvmem-block-tokens 128 (one record group); "
+                    "overriding %u\n", st.kparams.block_tokens);
+            st.kparams.block_tokens = 128;
         }
         llama_kvmem_set_params(&st.kparams);
     }
@@ -1944,6 +2016,24 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
     cparams.type_k = st.cache_type_k;
     cparams.type_v = st.cache_type_v;
+    // Resolve the K/V pair now that every argument has been seen. Asymmetric widths
+    // combine into a KxVy format; a KVarN/plain mix is rejected (see kvmem-spec.h).
+    {
+        const char * kvarn_err = nullptr;
+        if (!kvmem_kvarn_pair(st.kvarn_bits_k, st.kvarn_bits_v, st.plain_k, st.plain_v,
+                              &st.kvarn, &kvarn_err)) {
+            fprintf(stderr, "%s\n", kvarn_err ? kvarn_err : "unsupported KVarN cache type pair");
+            return 1;
+        }
+        if (st.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+            // KVarN replaces the row cache: the record arena owns the K/V bytes, so
+            // type_k/type_v above are simply unused. Without this assignment the context
+            // keeps params.kvarn = DISABLED and silently runs the plain row cache.
+            cparams.kvarn = st.kvarn;
+            fprintf(stderr, "KVMEM kvarN target cache: %s (group=%u sinkhorn_iters=%u)\n",
+                    llama_kvarn_type_name(st.kvarn.type), st.kvarn.group, st.kvarn.sinkhorn_iters);
+        }
+    }
     if (st.spec_mtp) {
         const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
         cparams.n_outputs_max = n_out;
@@ -1973,6 +2063,8 @@ int main(int argc, char ** argv) {
         sopts.type_k = st.cache_type_k;
         sopts.type_v = st.cache_type_v;
         sopts.draft_type = st.spec_cache_type;
+        sopts.kvarn = st.kvarn;
+        sopts.draft_kvarn = st.draft_kvarn;
         if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
             return 1;
         }

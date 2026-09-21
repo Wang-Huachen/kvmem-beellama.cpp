@@ -107,4 +107,46 @@ if (KVMEM_BUILD_LLAMA)
     target_include_directories(kvmem-output-limit-test PRIVATE tools llama.cpp/vendor/cpp-httplib)
     target_link_libraries(kvmem-output-limit-test PRIVATE llama-common cpp-httplib)
     add_test(NAME kvmem-output-limit-test COMMAND kvmem-output-limit-test)
+
+    # Model-free KVarN "whole crate move" self test: seal a record group with
+    # ggml_kvarn_store, copy its bytes to another slot, read both back with
+    # ggml_kvarn_materialize and compare bit for bit. Needs the KVarN encoder,
+    # which lives in llama.cpp/src/llama-kvarn.cpp, plus llama.cpp/src for
+    # llama-kvarn.h.
+    add_executable(kvarn-move-selftest
+        tests/kvarn-move-selftest.cpp
+        llama.cpp/src/llama-kvarn.cpp)
+    target_include_directories(kvarn-move-selftest PRIVATE
+        llama.cpp/src
+        llama.cpp/include
+        llama.cpp/ggml/include)
+    target_link_libraries(kvarn-move-selftest PRIVATE ggml)
+    target_compile_features(kvarn-move-selftest PRIVATE cxx_std_17)
+    if (MSVC)
+        target_compile_options(kvarn-move-selftest PRIVATE /utf-8)
+    endif()
+    add_test(NAME kvarn-move-selftest COMMAND kvarn-move-selftest)
+    set_tests_properties(kvarn-move-selftest PROPERTIES SKIP_RETURN_CODE 77)
+
+    # KVMem + KVarN smoke test: drive KVMem with its inner cache swapped onto the
+    # KVarN record arena and prove the stack survives a prefill plus a few decode
+    # steps. Skipped (exit 77) when no model can be found.
+    #
+    # Links `llama` ONLY, never `llama-common`: this tree can have
+    # build\llama.cpp\common\Release\llama-common.lib stuck in an OS-level
+    # delete-pending state, which fails every llama-common executable with
+    # LNK1114 (error 5). Using the public llama.h API keeps this test buildable in
+    # the normal tree without touching that library.
+    add_executable(kvmem-kvarn-smoke tests/kvmem-kvarn-smoke.cpp)
+    target_include_directories(kvmem-kvarn-smoke PRIVATE
+        src/adapter
+        llama.cpp/include
+        llama.cpp/ggml/include)
+    target_link_libraries(kvmem-kvarn-smoke PRIVATE llama)
+    target_compile_features(kvmem-kvarn-smoke PRIVATE cxx_std_17)
+    if (MSVC)
+        target_compile_options(kvmem-kvarn-smoke PRIVATE /utf-8)
+    endif()
+    add_test(NAME kvmem-kvarn-smoke COMMAND kvmem-kvarn-smoke)
+    set_tests_properties(kvmem-kvarn-smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()

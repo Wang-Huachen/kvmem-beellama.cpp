@@ -119,6 +119,8 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 
 #include <vector>
 #include <string>
+#include <cstdio>
+#include <cstring>
 
 struct llama_kvmem_row_range {
     int32_t begin = 0;
@@ -131,6 +133,35 @@ struct llama_kvmem_transfer_stats {
 };
 LLAMA_API llama_kvmem_transfer_stats llama_kvmem_get_transfer_stats();
 void kvmem_record_transfer(int cuda_kind, uint64_t bytes);
+
+// Why this exists: retrieval scores a block by dotting the captured query-sum
+// against the block's mean pre-RoPE K. That ledger is fed ONLY by the graph
+// capture hooks (llm_graph_context::kvmem_capture_q / _k), and those hooks are
+// wired by exactly two model files today: src/models/qwen3.cpp and
+// src/models/qwen35.cpp. On any other architecture the ledger stays empty, every
+// block scores 0, and the selector silently returns recency -- with no error and
+// no warning. (Measured on Hy-MT2-1.8B, a Hunyuan model: 0 captured Q layers and
+// 0 ledger blocks with KVarN both OFF and ON, i.e. that model never had retrieval
+// to begin with, independent of the cache format.)
+// These counters make that state observable instead of silent.
+struct llama_kvmem_retrieval_stats {
+    int32_t  method = 0;        // 0 recency, 1 retrieval
+    uint32_t runs = 0;          // score_retrieval() invocations
+    uint32_t blocks = 0;        // logical blocks in the store
+    uint32_t resident = 0;      // blocks holding a GPU slot
+    uint32_t have_block = 0;    // blocks with a mean-K ledger entry
+    uint32_t q_layers = 0;      // layers holding a captured query sum
+    uint32_t scored = 0;        // blocks whose final score was non-zero
+    float    max_score = 0.0f;
+    uint64_t reg_k = 0;         // mean-K capture registrations (arch wired the hook)
+    uint64_t reg_q = 0;         // Q capture registrations
+    uint64_t write_k = 0;       // mean-K ledger writes
+    uint64_t write_q = 0;       // query-sum accumulations
+    // 1 when no capture hook was ever registered on this context: retrieval
+    // cannot score here at all, on any cache format.
+    int32_t  no_capture_hooks = 0;
+};
+LLAMA_API llama_kvmem_retrieval_stats llama_kvmem_get_retrieval_stats();
 struct llama_kvmem_turn_spans {
     std::vector<llama_kvmem_row_range> query;
     std::vector<llama_kvmem_row_range> mandatory;
@@ -164,4 +195,40 @@ LLAMA_API bool llama_kvmem_set_query(const llama_kvmem_query_state & state);
 LLAMA_API void llama_kvmem_freeze_query(bool frozen);
 LLAMA_API void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state);
 LLAMA_API void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state);
+
+// Resolves the KVarN cache-type names exactly the way beellama's own command line
+// does, so a KVMem tool accepts what a beellama tool accepts.
+//
+// beellama has NO --kvarn switch: KVarN is selected through the ordinary cache
+// types, e.g. "-ctk kvarn6" / "--cache-type-k kvarn6" and, for a speculative
+// draft, "--spec-draft-type-k kvarn4" (common/arg.cpp:386, 392-397,
+// kvarn_bits_from_cache_type()). The canonical internal spelling
+// ("kvarn_k6v6_g128", llama-kvarn.cpp:13) stays accepted because existing scripts
+// and log lines use it.
+//
+// Returns LLAMA_KVARN_TYPE_DISABLED when the string is not a KVarN name at all, so
+// the caller can fall back to the ordinary ggml cache-type table.
+inline llama_kvarn_type llama_kvmem_kvarn_type_from_name(const char * name) {
+    static const struct { const char * text; int bits; } kShort[] = {
+        { "kvarn2", 2 }, { "kvarn3", 3 }, { "kvarn4", 4 },
+        { "kvarn5", 5 }, { "kvarn6", 6 }, { "kvarn8", 8 },
+    };
+    if (!name) {
+        return LLAMA_KVARN_TYPE_DISABLED;
+    }
+    for (const auto & e : kShort) {
+        if (std::strcmp(name, e.text) == 0) {
+            char canon[32];
+            std::snprintf(canon, sizeof(canon), "kvarn_k%dv%d_g128", e.bits, e.bits);
+            return llama_kvarn_type_from_name(canon);
+        }
+    }
+    // llama_kvarn_type_from_name() answers LLAMA_KVARN_TYPE_INVALID (-1) for an
+    // unknown name, while every caller here only asks "is this a KVarN name?" and
+    // tests for DISABLED. Normalising INVALID to DISABLED matters: without it
+    // "-ctk q8_0" looks like a KVarN request and the context is created with an
+    // invalid KVarN type, which fails llama_init_from_model.
+    const llama_kvarn_type t = llama_kvarn_type_from_name(name);
+    return t == LLAMA_KVARN_TYPE_INVALID ? LLAMA_KVARN_TYPE_DISABLED : t;
+}
 #endif

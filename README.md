@@ -8,7 +8,7 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [beellama.cpp](https://github.com/Anbeeld/beellama.cpp), a KVarN-capable fork of llama.cpp. beellama.cpp handles model loading, inference, quantization, Flash Attention and MTP; its KVarN cache types (`-ctk kvarn4` … `kvarn8`) are the reason this project is based on it. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
@@ -88,20 +88,20 @@ Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.
 
 Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone is insufficient, and the CUDA version shown by `nvidia-smi` describes driver support. After upgrading the Toolkit, configure a **new build directory** and rebuild the binaries. Updating the driver or replacing CUDA DLLs does not fix CUDA kernels already compiled into an old binary.
 
-An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
+An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements. That script initializes the pinned submodule and applies the maintained patch itself, so no bash is required on Windows; it builds into `build-win/bin`.
 
 ```bash
-git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
-cd kvmem-llama.cpp
-git checkout v0.16.0-rc3
+git clone --recurse-submodules https://github.com/Wang-Huachen/kvmem-beellama.cpp.git
+cd kvmem-beellama.cpp
+git checkout master           # the beellama.cpp rebase lives on master until it is tagged
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
 ```
 
-The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
+The submodule is [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp) at **v0.4.6 (`78af8326`)**, selected for its KVarN cache types. `scripts/apply-patches.sh` applies the single cumulative `patches/llama-kvmem-current.patch`; running it twice is safe (it reverse-checks first). The previous per-file queue (`0001`–`0004` plus the upgrade patches) targeted the old ggml-org/llama.cpp base and is kept under `patches/legacy-ggml-org/` for reference only — do **not** apply it to the beellama.cpp submodule. See [patches/README.md](patches/README.md).
 
-`scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
+`scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models, and for the KVarN bit-width pairs). Binaries: `build/bin/llama-kvmem-server`. Expect a long first build: `FA_ALL_QUANTS=ON` expands to 169 standard FA pairs plus 36 KVarN bit-width pairs. On Windows, `scripts/windows/build.ps1` builds into `build-win/bin` instead.
 
 The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested RTX 5060 Ti. For another GPU, set `CMAKE_CUDA_ARCHITECTURES` to its appropriate target when running the script; other GPU targets have not been tested here.
 

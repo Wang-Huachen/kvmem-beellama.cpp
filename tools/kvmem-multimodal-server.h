@@ -102,7 +102,9 @@ static void multimodal_restore(ServerState & st, const MultimodalCheckpoint & ch
     }
     if (st.spec.ok && !live) {
         kvmem_scoped_ms carry_timer(st.mm_perf.carry_ms);
-        common_speculative_set_state(st.spec.spec, 0, checkpoint.data->draft_carry);
+        if (!common_speculative_set_state(st.spec.spec, 0, checkpoint.data->draft_carry)) {
+            throw std::runtime_error("multimodal draft carry restore failed");
+        }
     }
     if (truncate) {
         llama_kvmem_truncate_cached(checkpoint.row);
@@ -433,9 +435,19 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         llama_pos synced = 0;
         if (st.spec.ok) {
             common_speculative_get_state(st.spec.spec, 0, carry);
-            if (carry.size() < sizeof(synced)) throw std::runtime_error("MTP carry missing");
-            std::memcpy(&synced, carry.data(), sizeof(synced));
-            if (synced != eval_end) throw std::runtime_error("MTP has unsynchronized visual rows");
+            // the blob is enveloped (see common/speculative.h) - read the payload
+            // through the accessor instead of assuming a payload offset
+            size_t payload_size = 0;
+            const uint8_t * payload = common_speculative_state_payload(0, carry, payload_size);
+            if (payload == nullptr || payload_size < sizeof(synced)) {
+                throw std::runtime_error("MTP carry missing");
+            }
+            std::memcpy(&synced, payload, sizeof(synced));
+            if (synced != eval_end) {
+                kvmem_diag("KVMEM_MTP_SYNC_MISMATCH synced=%d eval_end=%d payload_bytes=%zu\n",
+                        (int) synced, (int) eval_end, payload_size);
+                throw std::runtime_error("MTP has unsynchronized visual rows");
+            }
         }
         kvmem_diag("KVMEM_TRACE multimodal_prefill context=%p prefix_hit_rows=%d lcp=%d new_text_rows=%u new_image_rows=%u replayed_rows=%u vision_encode_calls=%u encoder_ms=%.2f logical_cursor=%d model_cursor=%d mtp_synced_rows=%d cached_tail_rows=%u replay_reason=%s embedding_cache_bytes=%zu checkpoint_bytes=%zu\n",
                 (void *) st.ctx, base.row, lcp, st.mm_new_text, st.mm_new_image, st.mm_replayed,

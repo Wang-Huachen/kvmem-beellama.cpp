@@ -6,6 +6,8 @@
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**
 
+**基座变更（2026-09-21）：** 子模块已从 `ggml-org/llama.cpp`（pin `b81c99b`）换为 **[Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp) v0.4.6（`78af8326`）**，目的是使用它的 **KVarN** 缓存格式。补丁队列随之从「编号系列 `0001`–`0004` + 升级补丁」合并为**单个累计补丁** `patches/llama-kvmem-current.patch`；旧系列已移入 `patches/legacy-ggml-org/`（仅供参照，不要再应用）。因此**下文出现的旧 pin、`git am` 队列与 `0001`–`0004` 均为迁移前的记录**，现状以 [patches/README.md](../patches/README.md) 为准。
+
 上游对照：
 
 - KVMem 实现与文档：[kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)
@@ -38,7 +40,7 @@
 | 追上 qw3-native 在 Blackwell + Qwen3.6 的 tok/s | 那是 FlashInfer / MMQ / NVFP4，不是 KVMem |
 | KVMem + continuous batching / 多 slot | qw3 也未完成；和 unified KV 冲突 |
 | 自研 MTP 投机状态机 / 方案 A（MTP KV 跟 `-c` 涨） | 投机用 llama.cpp `draft-mtp`；显存必须方案 B。见 [kvmem-mtp-plan.md](kvmem-mtp-plan.md) |
-| 把整套 KVMem 合进 ggml-org/llama.cpp | 先 submodule；最多上游一个 hook PR |
+| 把整套 KVMem 合进 beellama.cpp | 先 submodule；最多上游一个 hook PR |
 | 把 qw3 的 NVFP4 / MMQ / FlashInfer 搬过来 | 超出本项目 |
 
 ---
@@ -95,11 +97,10 @@ kvmem_llamacpp/
       nvme_kv_tier_test.cpp
       reselect_diff_test.cpp
     CMakeLists.txt
-  llama.cpp/                      ← git submodule，钉 tag
-  patches/                        ← 对该 tag 的 git am 队列
-    0001-memory-factory-hook.patch
-    0002-attn-qk-capture-hook.patch      ← P2
-    0003-cli-kvmem-flags.patch
+  llama.cpp/                      ← git submodule = Anbeeld/beellama.cpp v0.4.6（78af8326）
+  patches/                        ← 单个累计补丁（旧编号系列在 legacy-ggml-org/）
+    llama-kvmem-current.patch
+    legacy-ggml-org/              ← 旧 ggml-org 基座的补丁，仅供参照
   src/adapter/                    ← 唯一允许 include llama.cpp 的地方
     llama-memory-kvmem.h
     llama-memory-kvmem.cpp
@@ -124,10 +125,10 @@ kvmem_llamacpp/
 升级 llama.cpp 的固定动作：
 
 ```text
-1. git -C llama.cpp fetch && git -C llama.cpp checkout <new-tag>
-2. ./scripts/apply-patches.sh          # git am patches/*
-3. 冲突只允许出现在 hook 那三个文件
-4. ctest + identity/needle/overlap 回归
+1. git -C llama.cpp fetch && git -C llama.cpp checkout <new-beellama-tag>
+2. ./scripts/apply-patches.sh          # git apply 单个累计补丁（已打过则 no-op）
+3. 冲突只允许出现在 hook / adapter 那几个文件
+4. ctest + identity/needle/overlap 回归（当前脚本见 scripts/nightly/）
 ```
 
 ---

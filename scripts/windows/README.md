@@ -87,12 +87,15 @@ Install Visual Studio 2022 C++ Build Tools (MSVC x64, Windows SDK and the CMake
 tools including Ninja), Git for Windows and **CUDA Toolkit 13.2 Update 2
 (nvcc 13.2.86) or newer**. Version 13.2.86 is the tested Windows baseline;
 newer toolchains need their own correctness validation. Use an independent
-checkout on a Windows local drive, with its pinned llama.cpp submodule initialized:
+checkout on a Windows local drive, with its pinned beellama.cpp submodule
+initialized. The pinned submodule is **Anbeeld/beellama.cpp v0.4.6
+(`78af8326`)**; the validation record further down was collected before this
+rebase.
 
 ```powershell
-git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git C:\src\kvmem
-cd C:\src\kvmem
-git checkout v0.16.0-rc2
+git clone --recurse-submodules https://github.com/Wang-Huachen/kvmem-beellama.cpp.git C:\src\kvmem-beellama
+cd C:\src\kvmem-beellama
+git checkout master
 git submodule update --init
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\build.ps1 `
   -CudaPath 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2'
@@ -113,7 +116,7 @@ and pass the same `-BuildDir` to the launchers. Use the matching CUDA libraries
 when packaging. The `nvidia-smi` CUDA version is not the nvcc version.
 
 The script initializes the installed x64 MSVC environment, applies the maintained
-patch to the pinned llama.cpp source (or verifies it is already applied), builds
+patch to the pinned beellama.cpp source (or verifies it is already applied), builds
 the server/CLI/quantizer and runs model-free tests. Use a clean submodule: the
 script does not reset or discard local changes. Four build jobs are used by
 default; `-Jobs` changes this. `-CudaArchitectures` selects another GPU target.

@@ -46,6 +46,19 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    // cell-level removal is delegated to the inner cache; seq_rm_logical and
+    // seq_rm_cell both honour llama_kv_cell_ext::logical_pos
+    bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) override;
+    // must NOT delegate: the inner cache matches the raw pos, KVMem matches
+    // the logical pos (same convention as seq_rm_logical)
+    int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
+
+    // TODO(rebase): llama_memory_i::get_seq_rm_capability() is not overridden
+    // here, so beellama's permissive default is inherited. This follower cache
+    // mirrors the target slot pool and never allocates slots of its own, so its
+    // real capability is the target's. Override and delegate to target_ once
+    // the target's capability is defined.
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 

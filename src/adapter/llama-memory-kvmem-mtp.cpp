@@ -49,7 +49,9 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     kv_size_ = target_->kv_size();
     block_tokens_ = target_->block_tokens();
     if (block_tokens_ == 0) {
-        block_tokens_ = 32;
+        // The target pool always pins this to one KVarN record group; the literal
+        // is only a last-resort fallback and must match that granularity.
+        block_tokens_ = 128;
     }
     n_layer_trunk_ = model.hparams.n_layer();
     il_graph_ = n_layer_trunk_;
@@ -82,6 +84,13 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
             filter,
             nullptr,
             nullptr,
+            /* n_ubatch */ cparams.n_ubatch,
+            /* tail_tokens */ params.kv_tail_tokens,
+            /* tail_type */ params.kv_tail_type,
+            /* tail_tokens_requested */ params.kv_tail_tokens_requested,
+            /* tail_metadata_only */ false,
+            /* tail_rollback_tokens */ params.kv_tail_rollback_tokens,
+            /* tail_visibility_window */ 0,
             "kvmem-mtp");
 
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
@@ -171,7 +180,7 @@ bool llama_memory_kvmem_mtp::fill_from_target(
         const llama_pos pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
         int32_t slot = -1;
         uint32_t off = 0;
-        if (!target_->slot_for_orig_pos(pos, &slot, &off)) {
+        if (!target_->slot_for_orig_pos_virtual(pos, &slot, &off)) {
             LLAMA_LOG_ERROR("%s: no target slot for pos %d\n", __func__, (int) pos);
             return false;
         }
@@ -277,6 +286,36 @@ void llama_memory_kvmem_mtp::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     kv_->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_memory_kvmem_mtp::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    if (target_) target_->note_attention_change();
+    return kv_->seq_rm_cell(seq_id, cell_idx);
+}
+
+int llama_memory_kvmem_mtp::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    if (seq_id < 0) {
+        return 0;
+    }
+    // a row is identified by its logical (original) position when it has one,
+    // which is why this does not delegate to the inner cache
+    const llama_kv_cells & cells = kv_->get_cells(seq_id);
+    int n_found = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const auto logical = cells.ext_get(i).logical_pos;
+        const auto p = logical >= 0 ? logical : cells.pos_get(i);
+        if (p != pos) {
+            continue;
+        }
+        if (cell_indices && n_found < n_max) {
+            cell_indices[n_found] = i;
+        }
+        ++n_found;
+    }
+    return n_found;
+}
+
 llama_pos llama_memory_kvmem_mtp::seq_pos_min(llama_seq_id seq_id) const {
     return kv_->seq_pos_min(seq_id);
 }
@@ -339,7 +378,7 @@ void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
         return;
     }
     const llama_kv_cells & cells = kv_->get_cells(0);
-    const uint32_t idx0 = (uint32_t) blk.gpu_slot * block_tokens_;
+    const uint32_t idx0 = target_->block_cell_base(blk.block_id);
     if (idx0 >= cells.size() || cells.is_empty(idx0)
             || cells.ext_get(idx0).logical_pos != (llama_pos) blk.orig_pos_start) {
         return;
@@ -352,7 +391,7 @@ void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
         return;
     }
     const uint32_t nt = blk.n_tokens;
-    const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
+    const uint32_t cell0 = target_->block_cell_base(blk.block_id);
     const size_t row = ggml_row_size(type_k_, n_embd_k_);
     std::vector<uint8_t> packed((size_t) nt * row);
     kvmem_tensor_get(kt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
@@ -372,7 +411,7 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
         return;
     }
     const llama_kv_cells & cells = kv_->get_cells(0);
-    const uint32_t idx0 = (uint32_t) blk.gpu_slot * block_tokens_;
+    const uint32_t idx0 = target_->block_cell_base(blk.block_id);
     if (idx0 >= cells.size() || cells.is_empty(idx0)
             || cells.ext_get(idx0).logical_pos != (llama_pos) blk.orig_pos_start) {
         return;
@@ -381,7 +420,7 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
         return;
     }
     const uint32_t nt = blk.n_tokens;
-    const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
+    const uint32_t cell0 = target_->block_cell_base(blk.block_id);
     ggml_tensor * vt = kv_->get_v_storage((int32_t) il_graph_);
     if (!vt) {
         return;
@@ -516,7 +555,7 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     }
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
-    const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
+    const uint32_t cell0 = target_->block_cell_base(blk.block_id);
 
     // Cold blocks: copy the GPU-format K saved at stage-out (already
     // RoPE+Hadamard+quant). Do not rebuild from unrotated raw-K — that path
@@ -561,7 +600,7 @@ void llama_memory_kvmem_mtp::harvest_resident_v() {
         if (b.gpu_slot < 0 || b.n_tokens == 0) {
             continue;
         }
-        const uint32_t idx = (uint32_t) b.gpu_slot * block_tokens_;
+        const uint32_t idx = target_->block_cell_base(b.block_id);
         if (idx >= cells.size() || cells.is_empty(idx)) {
             continue;
         }
@@ -595,7 +634,7 @@ void llama_memory_kvmem_mtp::follow_retrieval() {
         if (trace_) {
             fprintf(stderr, " %u", b.block_id);
         }
-        if (slot_holds(b.gpu_slot, b.orig_pos_start)) {
+        if (slot_holds(static_cast<int32_t>(target_->virtual_slot_of(b.block_id)), b.orig_pos_start)) {
             n_keep++;
             continue;
         }
