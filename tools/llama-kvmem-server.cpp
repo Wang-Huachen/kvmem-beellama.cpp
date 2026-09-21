@@ -1844,6 +1844,11 @@ int main(int argc, char ** argv) {
             st.reasoning_budget_default = budget;
         } else if (eq(arg, "--reasoning-budget-message")) {
             st.reasoning_budget_message = need(arg);
+        } else if (eq(arg, "--metrics") || eq(arg, "--no-metrics")) {
+            // Hub/launcher compatibility: the hub passes one of these when it starts an engine.
+            // This server has no Prometheus endpoint; accepting the flag is what matters, since
+            // rejecting it makes the hub abort with "unknown flag: --metrics".
+            LOG_INF("srv    %s accepted (this server has no Prometheus /metrics endpoint)\n", arg);
         } else {
             fprintf(stderr, "unknown flag: %s\n", arg);
             print_usage(argv[0]);
@@ -2838,6 +2843,10 @@ int main(int argc, char ** argv) {
             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
             st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,
             st.reasoning_budget_default, st.query_max_tokens);
+    // Hub/launcher readiness signal: the hub scans engine output for this exact line. It is what
+    // beellama's own server prints from update_slots (trace level, inside a loop this server does
+    // not run), so keep the wording byte-identical.
+    LOG_INF("%s", "srv  update_slots: all slots are idle\n");
     if (!svr.listen_after_bind()) {
         fprintf(stderr, "listen failed\n");
         return 1;
