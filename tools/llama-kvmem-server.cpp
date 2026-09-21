@@ -2469,6 +2469,11 @@ int main(int argc, char ** argv) {
                     {"predicted_ms", gen_ms},
                     {"predicted_per_token_ms", n_gen > 0 ? gen_ms / (double) n_gen : 0.0},
                     {"predicted_per_second", predicted_per_second},
+                    // Hub recorder: speculative decode counters ride the timings block
+                    // (0 for non-speculative runs). The speculative paths overwrite these
+                    // once the decode loop reports its stats.
+                    {"draft_n", 0},
+                    {"draft_n_accepted", 0},
                     {"cache_n", cache_n}
                 };
                 if (!verbose) {
@@ -2575,6 +2580,10 @@ int main(int argc, char ** argv) {
                     std::string content;
                     StreamChatOut sco(formatted, parse_tools, request_id);
                     bool aborted = false;
+                    // Hub recorder: speculative decode counters, filled by the spec path below
+                    // and published on the final timings block (0 for non-speculative runs).
+                    int spec_draft_n = 0;
+                    int spec_draft_n_accepted = 0;
                     if (spec_stream) {
                         const auto gst = kvmem_spec_generate(st.ctx, st.model, st.spec, toks, max_tokens, sparams,
                             [&](llama_token id, const std::string & piece, bool) {
@@ -2591,6 +2600,8 @@ int main(int argc, char ** argv) {
                             st.active_prompt->model_pos(toks.size()) - (llama_pos) toks.size());
                         aborted = io.aborted || gst.failed;
                         st.mm_live_row = gst.n_past;
+                        spec_draft_n = gst.n_drafted;
+                        spec_draft_n_accepted = gst.n_accept;
                         if (gst.failed) send(json{{"error", "speculative decode failed"}}.dump());
                     } else {
                         common_sampler * smpl = nullptr;
@@ -2669,6 +2680,11 @@ int main(int argc, char ** argv) {
                         llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
                         commit_cached(st, toks, gen);
+                        // Hub recorder: publish the speculative counters after the last
+                        // emit_gen_wall (that call rewrites *timings wholesale). On this
+                        // non-speculative path both stay 0.
+                        (*timings)["draft_n"] = spec_draft_n;
+                        (*timings)["draft_n_accepted"] = spec_draft_n_accepted;
                         send(stream_choice_chunk(cid, st.model_name, created, json::object(), finish).dump());
                         auto usage = stream_usage_chunk(cid, st.model_name, created, (int) toks.size(), (int) gen.size(), n_cache_hit);
                         usage["timings"] = *timings;
@@ -2699,6 +2715,10 @@ int main(int argc, char ** argv) {
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
                     emit_gen_wall((int) gen.size());
                     commit_cached(st, toks, gen);
+                    // Hub recorder: publish the speculative counters after the last
+                    // emit_gen_wall (that call rewrites *timings wholesale).
+                    (*timings)["draft_n"] = spec_draft_n;
+                    (*timings)["draft_n_accepted"] = spec_draft_n_accepted;
                     send(stream_choice_chunk(cid, st.model_name, created, json::object(), finish).dump());
                     auto usage = stream_usage_chunk(cid, st.model_name, created, (int) toks.size(), (int) gen.size(), n_cache_hit);
                     usage["timings"] = *timings;
@@ -2758,6 +2778,9 @@ int main(int argc, char ** argv) {
             st.mm_live_row = gst.n_past;
             if (io.aborted) return;
             emit_gen_wall((int) gen.size());
+            // Hub recorder: publish the speculative counters after the last emit_gen_wall.
+            (*timings)["draft_n"] = gst.n_drafted;
+            (*timings)["draft_n_accepted"] = gst.n_accept;
             commit_cached(st, toks, gen);
             emit_json(content, (int) gen.size(), (int) gen.size() >= cr.max_tokens);
             return;
