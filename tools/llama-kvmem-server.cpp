@@ -2010,13 +2010,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // --threads / --threads-batch <= 0 mean "hardware concurrency" (as this server's help
+    // text promises); resolve it the same way the stock server does through common.
+    // The vision projector wants the number too: it is a separate mtmd context and
+    // otherwise keeps mtmd_context_params_default()'s 4 threads, ignoring --threads.
+    const int n_cpu_threads       = options.threads       > 0 ? options.threads       : (int) common_cpu_get_num_math();
+    const int n_cpu_threads_batch = options.threads_batch > 0 ? options.threads_batch : n_cpu_threads;
+
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = (uint32_t) n_ctx;
     cparams.n_batch = (uint32_t) st.n_batch;
     cparams.n_ubatch = options.ubatch > 0 ? options.ubatch : st.n_batch;
-    if (options.threads > 0) cparams.n_threads = options.threads;
-    if (options.threads_batch > 0) cparams.n_threads_batch = options.threads_batch;
-    else if (options.threads > 0) cparams.n_threads_batch = options.threads;
+    cparams.n_threads       = n_cpu_threads;
+    cparams.n_threads_batch = n_cpu_threads_batch;
     if (options.flash_attn_set) cparams.flash_attn_type = options.flash_attn;
     cparams.n_seq_max = 1;
     cparams.type_k = st.cache_type_k;
@@ -2061,8 +2067,8 @@ int main(int argc, char ** argv) {
         sopts.n_ctx = n_ctx;
         sopts.n_batch = st.n_batch;
         sopts.n_ubatch = cparams.n_ubatch;
-        sopts.n_threads = options.threads;
-        sopts.n_threads_batch = options.threads_batch > 0 ? options.threads_batch : options.threads;
+        sopts.n_threads = n_cpu_threads;
+        sopts.n_threads_batch = n_cpu_threads_batch;
         if (options.flash_attn_set) sopts.flash_attn = options.flash_attn;
         sopts.kvmem_enabled = st.kparams.enabled;
         sopts.type_k = st.cache_type_k;
@@ -2079,7 +2085,7 @@ int main(int argc, char ** argv) {
         try {
             if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
                 throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
-            st.vision = std::make_unique<kvmem_vision>(st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens);
+            st.vision = std::make_unique<kvmem_vision>(st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens, n_cpu_threads);
         } catch (const std::exception & e) {
             fprintf(stderr, "%s\n", e.what());
             return 1;

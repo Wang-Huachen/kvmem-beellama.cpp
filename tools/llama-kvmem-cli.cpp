@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
+#include "common.h"   // common_cpu_get_num_math() for --threads <= 0
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +26,8 @@ static void print_usage(const char * argv0) {
             "  -ub, --ubatch-size N       physical ubatch (default 512)\n"
             "  -ngl, --n-gpu-layers N     GPU layers (default 99)\n"
             "  --temp T                   temperature; 0 = greedy (default 0)\n"
+"  -t, --threads N            CPU threads; <= 0 = hardware concurrency (default -1)\n"
+"  -tb, --threads-batch N     CPU threads for prompt processing; <= 0 = as --threads\n"
             "  --tokens-only              print generated token ids, one per line\n"
             "  --no-prompt                do not echo the prompt (generation only)\n"
             "  --kvmem                    enable KVMem slot-pool memory\n"
@@ -72,6 +75,11 @@ int main(int argc, char ** argv) {
     int n_batch = 512;
     int n_ubatch = 512;
     int ngl = 99;
+    // <= 0 means hardware concurrency, resolved through llama-common exactly like the
+    // stock tools do (this CLI used to ignore threads entirely and run on the
+    // llama_context default of 4).
+    int n_threads = -1;
+    int n_threads_batch = -1;
     float temp = 0.0f;
     bool tokens_only = false;
     bool no_prompt = false;
@@ -136,6 +144,10 @@ int main(int argc, char ** argv) {
             n_ubatch = std::atoi(need(arg));
         } else if (eq(arg, "-ngl") || eq(arg, "--n-gpu-layers")) {
             ngl = std::atoi(need(arg));
+        } else if (eq(arg, "-t") || eq(arg, "--threads")) {
+            n_threads = std::atoi(need(arg));
+        } else if (eq(arg, "-tb") || eq(arg, "--threads-batch")) {
+            n_threads_batch = std::atoi(need(arg));
         } else if (eq(arg, "--temp")) {
             temp = std::atof(need(arg));
         } else if (eq(arg, "--tokens-only")) {
@@ -407,7 +419,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const int n_cpu_threads       = n_threads       > 0 ? n_threads       : (int) common_cpu_get_num_math();
+    const int n_cpu_threads_batch = n_threads_batch > 0 ? n_threads_batch : n_cpu_threads;
+
     llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_threads = n_cpu_threads;
+    ctx_params.n_threads_batch = n_cpu_threads_batch;
     ctx_params.n_ctx = static_cast<uint32_t>(n_ctx);
     ctx_params.n_batch = static_cast<uint32_t>(n_batch);
     ctx_params.n_ubatch = static_cast<uint32_t>(n_ubatch);
@@ -447,6 +464,8 @@ int main(int argc, char ** argv) {
         sopts.n_ctx = n_ctx;
         sopts.n_batch = n_batch;
         sopts.n_ubatch = n_ubatch;
+        sopts.n_threads = n_cpu_threads;
+        sopts.n_threads_batch = n_cpu_threads_batch;
         sopts.kvmem_enabled = kparams.enabled;
         sopts.draft_model = spec_draft_model;
         sopts.type_k = cache_type_k;
