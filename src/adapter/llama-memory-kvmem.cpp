@@ -992,6 +992,17 @@ uint32_t llama_memory_kvmem::block_cell_base(uint32_t block_id) const {
     return virtual_slot_of(block_id) * block_tokens_;
 }
 
+// ---- RECORD-GROUP ACCEPTANCE PROBE (KVMEM_PERF=1, read-only) ----------------
+// restore_records() may only run once the batch's virtual numbers exist, because
+// KVarN names a record group by the cells it is handed, i.e. by that number. Writing
+// earlier resolves virtual_slot_of() while the block is not in vslot_ yet, which
+// silently falls back to the PHYSICAL pool slot -- a group the arena never reads.
+// g_rec_written_group records what was written so the next numbering pass can report
+// whether the two agree; g_rec_pending_restore is the deferral itself (see
+// write_block_to_gpu() and prepare_ubatches()).
+static std::unordered_map<uint32_t, uint32_t> g_rec_written_group;
+static std::vector<uint32_t> g_rec_pending_restore;
+
 void llama_memory_kvmem::assign_virtual_slots() {
     if (!kvarn_) {
         return;
@@ -1070,6 +1081,23 @@ void llama_memory_kvmem::assign_virtual_slots() {
         if (store.blocks()[id].gpu_slot < 0) {
             vslot_[id] = -1;
         }
+    }
+
+    // ---- ACCEPTANCE PROBE: is the group we wrote the group we are about to read? --
+    // Consumed once, at the first numbering pass after the record write -- which is
+    // exactly the number this batch hands to the arena. MATCH means the write side is
+    // consistent; MISMATCH means the restored bytes sit in another block's group.
+    if (perf_.enabled && !g_rec_written_group.empty()) {
+        for (const auto & it : g_rec_written_group) {
+            const uint32_t bid  = it.first;
+            const uint32_t wrot = it.second;
+            const int32_t  now  = bid < vslot_.size() ? vslot_[bid] : -2;
+            const char * verdict = now < 0 ? "GONE"
+                                 : static_cast<uint32_t>(now) == wrot ? "MATCH" : "MISMATCH";
+            fprintf(stderr, "KVMEM_REC_GROUP_CHECK block=%u wrote_group=%u now_vslot=%d %s\n",
+                    bid, wrot, now, verdict);
+        }
+        g_rec_written_group.clear();
     }
 }
 
@@ -2068,6 +2096,31 @@ bool llama_memory_kvmem::prepare_ubatches(
     // Must happen before sinfos are built, since those carry the numbers handed to
     // the arena. Cheap: it only ranks the resident blocks.
     assign_virtual_slots();
+
+    // Staged-in records are written HERE, not in apply_selection(): the arena names a
+    // record group by the cells it is handed, and those cells carry the VIRTUAL number
+    // assigned just above. Before this point the block is not in vslot_ yet, so
+    // virtual_slot_of() silently answers with the PHYSICAL pool slot -- measured 91/91
+    // wrong groups before this flush existed (wrote 20, read 440).
+    if (!g_rec_pending_restore.empty()) {
+        const std::vector<uint32_t> pending = g_rec_pending_restore;
+        g_rec_pending_restore.clear();
+        for (uint32_t bid : pending) {
+            if (restore_records(bid)) {
+                occupy_block_cells(bid);
+                continue;
+            }
+            if (block_records_snapshotable(bid)) {
+                // write_block_to_gpu() only defers blocks that have a snapshot, so this
+                // means the snapshot was released in between. Reading those rows would
+                // silently serve another block's records -- the reinterpretation the
+                // design forbids. Fail closed.
+                LLAMA_LOG_ERROR("%s: deferred record restore for block %u failed; "
+                        "refusing to let it read another block's records\n", __func__, bid);
+                GGML_ABORT("%s: deferred record restore failed for block %u", __func__, bid);
+            }
+        }
+    }
     sinfos.clear();
     sinfos.reserve(ubatches.size());
     for (const auto & ubatch : ubatches) {
@@ -3763,7 +3816,15 @@ bool llama_memory_kvmem::block_records_snapshotable(uint32_t block_id) const {
     if (blk.gpu_slot < 0 || blk.n_tokens == 0) {
         return false;
     }
-    if (blk.gpu_slot == 0) {
+    // The record group is a VIRTUAL number, not the physical pool slot. KVarN
+    // names a group by `cell / KVAR_N_GROUP` (ggml-cuda/kvarn.cu: `group_global =
+    // kvarn_index_cell(idx) / KVAR_N_DIM`, then `record = records +
+    // flush_record_group * ...`), and the cells KVMem hands the arena come from
+    // virtual_slot_of() (occupy_in() and kvmem_fill_slot_info(): `cell = vslot *
+    // block_tokens + off`). alloc_slot() hands out the *lowest free physical* slot
+    // and says so itself, so the two numberings only coincide while nothing has
+    // been evicted.
+    if (virtual_slot_of(block_id) == 0) {
         // KVarN's permanent sink group: never sealed as a record (the store
         // kernel skips group 0), always read from the F16 stage. Its record bytes
         // belong to whatever group last used the slot, so copying them out and
@@ -3809,6 +3870,9 @@ void llama_memory_kvmem::snapshot_records(uint32_t block_id) {
     std::vector<uint8_t> & blob = rec_host_[block_id];
     blob.assign(static_cast<size_t>(total), 0);
     uint64_t off = 0;
+    // The group the arena actually stored this block in -- the same number
+    // kvmem_fill_slot_info()/occupy_in() put into the cells it handed to KVarN.
+    const uint32_t rgroup = virtual_slot_of(block_id);
     for (uint32_t il = 0; il < n_layer_; ++il) {
         ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
         ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
@@ -3817,9 +3881,9 @@ void llama_memory_kvmem::snapshot_records(uint32_t block_id) {
         }
         const size_t kbytes = static_cast<size_t>(kt->nb[2]);
         const size_t vbytes = static_cast<size_t>(vt->nb[2]);
-        kvmem_tensor_get(kt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * kbytes, kbytes);
+        kvmem_tensor_get(kt, blob.data() + off, static_cast<size_t>(rgroup) * kbytes, kbytes);
         off += kbytes;
-        kvmem_tensor_get(vt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * vbytes, vbytes);
+        kvmem_tensor_get(vt, blob.data() + off, static_cast<size_t>(rgroup) * vbytes, vbytes);
         off += vbytes;
     }
     if (trace_) {
@@ -3843,6 +3907,9 @@ bool llama_memory_kvmem::restore_records(uint32_t block_id) {
         return false;
     }
     const std::vector<uint8_t> & blob = it->second;
+    // Same numbering as snapshot_records(): the group KVarN derived from the cells
+    // KVMem handed it, i.e. virtual_slot_of(), never the physical pool slot.
+    const uint32_t rgroup = virtual_slot_of(block_id);
     uint64_t off = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
@@ -3852,9 +3919,9 @@ bool llama_memory_kvmem::restore_records(uint32_t block_id) {
         }
         const size_t kbytes = static_cast<size_t>(kt->nb[2]);
         const size_t vbytes = static_cast<size_t>(vt->nb[2]);
-        kvmem_tensor_set(kt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * kbytes, kbytes);
+        kvmem_tensor_set(kt, blob.data() + off, static_cast<size_t>(rgroup) * kbytes, kbytes);
         off += kbytes;
-        kvmem_tensor_set(vt, blob.data() + off, static_cast<size_t>(blk.gpu_slot) * vbytes, vbytes);
+        kvmem_tensor_set(vt, blob.data() + off, static_cast<size_t>(rgroup) * vbytes, vbytes);
         off += vbytes;
     }
     return true;
@@ -3876,7 +3943,11 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         // There is no third route: KVarN has no row-wise write path, and the
         // pre-RoPE q8 rows in RawKvStore are not the same representation as a
         // sealed record (post-RoPE K in the Hadamard domain).
-        if (!restore_records(block_id)) {
+        auto it_snap = rec_host_.find(block_id);
+        const uint64_t total_snap = record_bytes_per_block();
+        const bool have_snapshot = it_snap != rec_host_.end() && total_snap != 0 &&
+                                   it_snap->second.size() == static_cast<size_t>(total_snap);
+        if (!have_snapshot) {
             if (block_records_snapshotable(block_id)) {
                 // A full block in a non-sink slot that has no host copy means the
                 // eviction that freed this block never snapshotted it. Restoring
@@ -3898,10 +3969,16 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
             }
             return;
         }
+        // DEFER the record write -- and the cell registration that must agree with it --
+        // to prepare_ubatches(), right after that batch's virtual numbers are final.
+        // Doing it here resolves virtual_slot_of() while the block is not in vslot_ yet,
+        // which silently falls back to the PHYSICAL pool slot: a group the arena never
+        // reads. Measured on the 27B (4 requests, KVarN, budget 61440): 91/91 writes
+        // landed on the wrong group -- e.g. wrote group 20 while the batch read 440.
         ++attention_epoch_;
-        occupy_block_cells(block_id);
+        g_rec_pending_restore.push_back(block_id);
         if (trace_) {
-            fprintf(stderr, "KVMEM_TRACE stage_in_record block=%u slot=%d n=%u orig=%u\n",
+            fprintf(stderr, "KVMEM_TRACE stage_in_record_deferred block=%u slot=%d n=%u orig=%u\n",
                     block_id, blk.gpu_slot, blk.n_tokens, blk.orig_pos_start);
         }
         return;
@@ -3982,6 +4059,11 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
             GGML_ABORT("%s: host record slot is too small", __func__);
         }
         auto * dst = static_cast<uint8_t *>(host);
+        // Records live in the group KVarN derived from the cells, i.e. the virtual
+        // slot -- see snapshot_records(). `gpu_slot` is the physical pool slot and
+        // is only the fallback when this block has no virtual number (evicted).
+        const uint32_t rgroup = (block_id < runtime_->store().block_count())
+                ? virtual_slot_of(block_id) : static_cast<uint32_t>(gpu_slot);
         uint64_t off = 0;
         for (uint32_t il = 0; il < n_layer_; ++il) {
             ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
@@ -3991,12 +4073,11 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
             }
             const size_t kbytes = static_cast<size_t>(kt->nb[2]);
             const size_t vbytes = static_cast<size_t>(vt->nb[2]);
-            kvmem_tensor_get(kt, dst + off, static_cast<size_t>(gpu_slot) * kbytes, kbytes);
+            kvmem_tensor_get(kt, dst + off, static_cast<size_t>(rgroup) * kbytes, kbytes);
             off += kbytes;
-            kvmem_tensor_get(vt, dst + off, static_cast<size_t>(gpu_slot) * vbytes, vbytes);
+            kvmem_tensor_get(vt, dst + off, static_cast<size_t>(rgroup) * vbytes, vbytes);
             off += vbytes;
         }
-        (void) block_id;
         return;
     }
 
@@ -4049,6 +4130,9 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
             GGML_ABORT("%s: host record slot is too small", __func__);
         }
         const auto * src = static_cast<const uint8_t *>(host);
+        // Same group as snapshot_records()/restore_records()/copy_gpu_block_to_host().
+        const uint32_t rgroup = (block_id < runtime_->store().block_count())
+                ? virtual_slot_of(block_id) : static_cast<uint32_t>(gpu_slot);
         uint64_t off = 0;
         for (uint32_t il = 0; il < n_layer_; ++il) {
             ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
@@ -4058,9 +4142,9 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
             }
             const size_t kbytes = static_cast<size_t>(kt->nb[2]);
             const size_t vbytes = static_cast<size_t>(vt->nb[2]);
-            kvmem_tensor_set(kt, src + off, static_cast<size_t>(gpu_slot) * kbytes, kbytes);
+            kvmem_tensor_set(kt, src + off, static_cast<size_t>(rgroup) * kbytes, kbytes);
             off += kbytes;
-            kvmem_tensor_set(vt, src + off, static_cast<size_t>(gpu_slot) * vbytes, vbytes);
+            kvmem_tensor_set(vt, src + off, static_cast<size_t>(rgroup) * vbytes, vbytes);
             off += vbytes;
         }
         return;
