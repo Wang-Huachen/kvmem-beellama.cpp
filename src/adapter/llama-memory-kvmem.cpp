@@ -3843,6 +3843,45 @@ bool llama_memory_kvmem::block_records_snapshotable(uint32_t block_id) const {
     return true;
 }
 
+namespace {
+
+struct RecStage {
+    void * base = nullptr;
+    uint64_t bytes = 0;
+    bool reserve(uint64_t want) {
+        if (want == 0) {
+            return false;
+        }
+        if (base && bytes >= want) {
+            return true;
+        }
+        void * fresh = nullptr;
+        if (cudaMallocHost(&fresh, static_cast<size_t>(want)) != cudaSuccess || !fresh) {
+            if (fresh) {
+                cudaFreeHost(fresh);
+            }
+            return false;
+        }
+        if (base) {
+            cudaFreeHost(base);
+        }
+        base = fresh;
+        bytes = want;
+        return true;
+    }
+    ~RecStage() {
+        if (base) {
+            cudaFreeHost(base);
+        }
+    }
+};
+
+RecStage & rec_stage() {
+    static thread_local RecStage stage;
+    return stage;
+}
+}  // namespace
+
 void llama_memory_kvmem::snapshot_records(uint32_t block_id) {
     if (!kvarn_ || block_id >= runtime_->store().block_count()) {
         return;
@@ -3869,23 +3908,64 @@ void llama_memory_kvmem::snapshot_records(uint32_t block_id) {
     }
     std::vector<uint8_t> & blob = rec_host_[block_id];
     blob.assign(static_cast<size_t>(total), 0);
-    uint64_t off = 0;
     // The group the arena actually stored this block in -- the same number
     // kvmem_fill_slot_info()/occupy_in() put into the cells it handed to KVarN.
     const uint32_t rgroup = virtual_slot_of(block_id);
-    for (uint32_t il = 0; il < n_layer_; ++il) {
+    RecStage & stage = rec_stage();
+    if (!stage.reserve(total)) {
+        // Without pinned staging the only route left is the per-call synchronizing
+        // copy this exists to remove, and a partial mirror must never be published
+        // as authoritative (restore_records() would write its missing half back as
+        // zeros). Keep the block GPU-resident instead.
+        if (rec_pinned_.size() <= block_id) {
+            rec_pinned_.resize(block_id + 1, 0);
+        }
+        rec_pinned_[block_id] = 1;
+        rec_host_.erase(block_id);
+        LLAMA_LOG_WARN("%s: no pinned record staging (%llu bytes); block %u stays GPU-resident\n",
+                __func__, (unsigned long long) total, block_id);
+        return;
+    }
+    uint8_t * const scratch = static_cast<uint8_t *>(stage.base);
+    const cudaStream_t st = cudaStreamPerThread;
+    bool copied = true;
+    uint64_t off = 0;
+    for (uint32_t il = 0; il < n_layer_ && copied; ++il) {
         ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
         ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
         if (!kt || !vt) {
             continue;
         }
-        const size_t kbytes = static_cast<size_t>(kt->nb[2]);
-        const size_t vbytes = static_cast<size_t>(vt->nb[2]);
-        kvmem_tensor_get(kt, blob.data() + off, static_cast<size_t>(rgroup) * kbytes, kbytes);
-        off += kbytes;
-        kvmem_tensor_get(vt, blob.data() + off, static_cast<size_t>(rgroup) * vbytes, vbytes);
-        off += vbytes;
+        ggml_tensor * pair[2] = { kt, vt };
+        const size_t pbytes[2] = { static_cast<size_t>(kt->nb[2]), static_cast<size_t>(vt->nb[2]) };
+        for (int which = 0; which < 2 && copied; ++which) {
+            ggml_tensor * t = pair[which];
+            const size_t nbytes = pbytes[which];
+            uint8_t * dev = kvmem_cuda_tensor_ptr(t);
+            if (dev) {
+                copied = kvmem_cuda_ok(kvmem_copy_async(scratch + off,
+                        dev + static_cast<size_t>(rgroup) * nbytes, nbytes,
+                        cudaMemcpyDeviceToHost, st), "record snapshot");
+            } else {
+                kvmem_tensor_get(t, scratch + off, static_cast<size_t>(rgroup) * nbytes, nbytes);
+            }
+            off += nbytes;
+        }
     }
+    const bool fence_ok = cudaStreamSynchronize(st) == cudaSuccess;
+    if (!copied || !fence_ok) {
+        if (rec_pinned_.size() <= block_id) {
+            rec_pinned_.resize(block_id + 1, 0);
+        }
+        rec_pinned_[block_id] = 1;
+        rec_host_.erase(block_id);
+        LLAMA_LOG_ERROR("%s: record snapshot for block %u failed; refusing to keep a partial "
+                "mirror\n", __func__, block_id);
+        return;
+    }
+    // Only what was read: a layer without records leaves the freshly zeroed tail of
+    // the mirror alone, exactly as the per-layer route did.
+    memcpy(blob.data(), scratch, static_cast<size_t>(off));
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE record_snapshot block=%u slot=%d bytes=%llu\n",
                 block_id, blk.gpu_slot, (unsigned long long) total);
@@ -3910,21 +3990,42 @@ bool llama_memory_kvmem::restore_records(uint32_t block_id) {
     // Same numbering as snapshot_records(): the group KVarN derived from the cells
     // KVMem handed it, i.e. virtual_slot_of(), never the physical pool slot.
     const uint32_t rgroup = virtual_slot_of(block_id);
+    RecStage & stage = rec_stage();
+    if (!stage.reserve(total)) {
+        // Fail closed: the caller aborts for a snapshotable block rather than let it
+        // read whatever another group left in that slot (see prepare_ubatches()).
+        LLAMA_LOG_ERROR("%s: no pinned record staging (%llu bytes); cannot restore block %u\n",
+                __func__, (unsigned long long) total, block_id);
+        return false;
+    }
+    uint8_t * const scratch = static_cast<uint8_t *>(stage.base);
+    memcpy(scratch, blob.data(), static_cast<size_t>(total));
+    const cudaStream_t st = cudaStreamPerThread;
+    bool copied = true;
     uint64_t off = 0;
-    for (uint32_t il = 0; il < n_layer_; ++il) {
+    for (uint32_t il = 0; il < n_layer_ && copied; ++il) {
         ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
         ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
         if (!kt || !vt) {
             continue;
         }
-        const size_t kbytes = static_cast<size_t>(kt->nb[2]);
-        const size_t vbytes = static_cast<size_t>(vt->nb[2]);
-        kvmem_tensor_set(kt, blob.data() + off, static_cast<size_t>(rgroup) * kbytes, kbytes);
-        off += kbytes;
-        kvmem_tensor_set(vt, blob.data() + off, static_cast<size_t>(rgroup) * vbytes, vbytes);
-        off += vbytes;
+        ggml_tensor * pair[2] = { kt, vt };
+        const size_t pbytes[2] = { static_cast<size_t>(kt->nb[2]), static_cast<size_t>(vt->nb[2]) };
+        for (int which = 0; which < 2 && copied; ++which) {
+            ggml_tensor * t = pair[which];
+            const size_t nbytes = pbytes[which];
+            uint8_t * dev = kvmem_cuda_tensor_ptr(t);
+            if (dev) {
+                copied = kvmem_cuda_ok(kvmem_copy_async(dev + static_cast<size_t>(rgroup) * nbytes,
+                        scratch + off, nbytes, cudaMemcpyHostToDevice, st), "record restore");
+            } else {
+                kvmem_tensor_set(t, scratch + off, static_cast<size_t>(rgroup) * nbytes, nbytes);
+            }
+            off += nbytes;
+        }
     }
-    return true;
+    const bool fence_ok = cudaStreamSynchronize(st) == cudaSuccess;
+    return copied && fence_ok;
 }
 
 void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
