@@ -189,7 +189,13 @@ static bool decode_one(llama_context * ctx, const std::vector<llama_token> & tok
 // today and must keep working).
 struct opts {
     const char * model        = nullptr;
-    const char * kvarn_type   = "k4v4";
+    // Must be a name the -ctk parser below accepts: `kvarn2`..`kvarn8`, or the long
+    // `kvarn_k4v4_g128` form (llama_kvarn_type_from_name). This used to be "k4v4",
+    // which is only the *display* form of the parsed pair -- it is NOT parseable, so
+    // `kvmem-kvarn-smoke <model>` with no -ctk exited 1 with
+    // "cannot parse -ctk 'k4v4'". The nightly bats always pass -ctk explicitly, which
+    // is why it went unnoticed.
+    const char * kvarn_type   = "kvarn4";
     const char * kv_dtype     = "q8_0";
     uint32_t     block_tokens = 128;
     int32_t      n_ctx        = 512;
