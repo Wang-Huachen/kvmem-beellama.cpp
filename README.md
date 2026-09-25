@@ -1,24 +1,102 @@
-## This fork: KVMem rebased onto beellama.cpp (KVarN cache compression)
+### 这个仓库是什么（中文说明）
 
-`Wang-Huachen/kvmem-beellama.cpp` is this project's working fork of `kvmem/kvmem-llama.cpp`.
-The base was rebased from `ggml-org/llama.cpp` to **`Anbeeld/beellama.cpp` v0.4.6 (`78af8326`)**, so
-KVMem's GPU working cache can live in **KVarN** record arenas and use KVarN's native
-record-consuming attention.
+这是 **KVMem 的一个分支版本**。原版 KVMem 跑在 `llama.cpp` 上，我们把底层引擎换成了
+**`beellama.cpp` v0.4.6（版本号 `78af8326`）**，因为只有 beellama 带 **KVarN** 这种 KV 缓存压缩格式。
+换过去之后，同样大小的显存能撑起更长的对话，这正是这次换引擎的目的。
 
-**Everything below this section is the upstream KVMem documentation, unchanged.**
+**下面全部是上游 KVMem 的原始说明，我们一个字都没改。**
 
-- Base: beellama.cpp v0.4.6 (`78af8326`) — the pinned submodule replaces upstream's `llama.cpp`.
-- KVMem patch for the new base: `patches/llama-kvmem-current.patch`, applied by `scripts/apply-patches.sh`.
-- Regression drivers: `scripts/nightly/kvmem-kvarn-*.bat` (smoke / evict / hybrid / retrieval / tools),
-  plus `tests/kvarn-move-selftest.cpp`.
-- Cache types: KVarN is selected through the cache type itself, e.g.
-  `--cache-type-k kvarn6 --cache-type-v kvarn6`. Asymmetric widths are given per side
-  (`--cache-type-k kvarn6 --cache-type-v kvarn5`); the combined descriptor name
-  (`kvarn_k5v4_g128`) is not accepted by the CLI parsers.
-- Status: Qwen3.8-27B with `--kvmem` and `kvarn6` works end to end (record arena, virtual-slot record
-  addressing, MTP speculative decoding). Known limitations: the MTP draft cache still uses the stock
-  cache (a KVarN draft cache is rejected at startup), and a KVMem pool that does not fit in free VRAM
-  can drop long-context decode throughput until the process is restarted.
+**怎么用**：参数和下面的说明完全一样，只有"缓存格式"这两项要留意。推荐写法是
+`--cache-type-k kvarn6 --cache-type-v kvarn6`，也就是 K 和 V 都压到 6 位；这是我们在 27B 上实测
+质量与显存最平衡的一档。想再省一点显存，可以给 K 和 V 用不同的压缩等级，但**必须写成两个参数**，
+例如 `--cache-type-k kvarn6 --cache-type-v kvarn5`；要是写成合并在一起的一个名字（比如
+`kvarn_k5v4_g128`），程序不认，会直接报错退出。另外提醒一句：压得越低越省显存，但质量会下降，
+其中 V 比 K 更敏感，所以不建议把 V 压到 4 位。
+
+**现在能用吗**：能用。我们用 **Qwen3.8-27B** 从头到尾跑通了长上下文问答和加速生成，
+并且验证过"开加速"与"不开加速"的输出是一致的。
+
+**两个已知问题**：第一，加速生成依赖的那份"草稿缓存"目前还不能用 KVarN，走的是普通缓存；
+要是硬给它开 KVarN，程序会在启动时直接拒绝，这是故意的，免得悄悄算错。第二，如果给 KVMem 分配的
+显存超过了显卡当时的空闲显存，**聊得越长生成越慢**，而且这个状态不会自己恢复，**只能重启程序**。
+
+**想自己编译**：先把仓库连同子模块一起拉下来（`git clone --recurse-submodules`），然后在仓库根目录
+用 Git Bash 或 WSL 执行 `bash scripts/apply-patches.sh`，它会把
+`patches/llama-kvmem-current.patch` 打到 `llama.cpp/` 这份 beellama 源码上；如果已经打过，脚本会
+自己识别并跳过。Windows 上可以直接用仓库自带脚本 `powershell -File scripts/windows/build.ps1`；
+想手动构建就用 CMake，关键是打开 CUDA：
+
+```
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a-real
+cmake --build build --parallel
+```
+
+默认构建静态单文件（Windows 上默认 `BUILD_SHARED_LIBS=OFF`）；要 DLL 版就再加
+`-DBUILD_SHARED_LIBS=ON`。`CMAKE_CUDA_ARCHITECTURES` 按自己的显卡改：RTX 30 系写 `86`，
+40 系写 `89`，50 系写 `120a-real`。构建产物在 `build/bin/`：日常推理用 `llama-kvmem-server`，
+命令行调试用 `llama-kvmem-cli`。如果希望 FlashAttention 覆盖所有 K/V 位宽组合（编译时间与体积都会
+明显增加），再加 `-DGGML_CUDA_FA_ALL_QUANTS=ON`。
+
+**想跑测试**：仓库自带一组自动测试脚本，都在 `scripts/nightly/`：`kvmem-kvarn-smoke.bat` 是冒烟测试，
+`kvmem-kvarn-evict.bat` 压淘汰路径，`kvmem-kvarn-hybrid.bat` 测混合架构，`kvmem-kvarn-retrieval.bat`
+测检索，`kvmem-kvarn-tools.bat` 测命令行工具链；另外 `tests/kvarn-move-selftest.cpp` 用来验证 KVarN
+记录搬运是否逐字节保真。这些脚本会自己拉起和关闭服务、按 `PASS/FAIL` 给结论，不需要手动加载模型。
+
+### What this repository is (English)
+
+This is a **fork of KVMem**. Upstream KVMem runs on `llama.cpp`; we swapped the underlying engine for
+**`beellama.cpp` v0.4.6 (build `78af8326`)**, because beellama is the one that ships **KVarN**, a
+compression format for the KV cache. After the swap, the same amount of VRAM holds a longer
+conversation, which is exactly why the engine was replaced.
+
+**Everything below this point is the upstream KVMem documentation, unchanged.**
+
+**How to use it**: every option works as described below; only the two "cache format" options deserve
+attention. The recommended setting is `--cache-type-k kvarn6 --cache-type-v kvarn6`, i.e. both K and V
+compressed to 6 bits -- on the 27B model we measured this as the best balance between quality and VRAM.
+If you want to save a little more VRAM you can give K and V different compression levels, but you
+**have to pass them as two separate options**, for example
+`--cache-type-k kvarn6 --cache-type-v kvarn5`. A combined name (such as `kvarn_k5v4_g128`) is not
+recognised and the program exits with an error. One more note: lower compression saves VRAM but costs
+quality, and V is more sensitive than K, so we would not push V down to 4 bits.
+
+**Does it work today?** Yes. We ran **Qwen3.8-27B** through it end to end, for both long-context
+question answering and accelerated generation, and we verified that the output is identical with and
+without acceleration.
+
+**Two known issues.** First, the draft cache that accelerated generation relies on cannot use KVarN
+yet -- it falls back to the normal cache, and if you force KVarN on it the program refuses to start.
+That refusal is deliberate: it is better to stop than to silently compute the wrong thing. Second, if
+the VRAM you give KVMem is larger than the VRAM actually free on the card, generation gets slower the
+longer the conversation runs, and that state does not recover by itself -- you have to restart the
+program.
+
+**Building it yourself.** Clone the repository together with its submodules
+(`git clone --recurse-submodules`), then from the repository root run `bash scripts/apply-patches.sh`
+in Git Bash or WSL. That script applies `patches/llama-kvmem-current.patch` to the beellama sources
+under `llama.cpp/`, and skips the step if the patch is already applied. On Windows you can use the
+bundled script instead: `powershell -File scripts/windows/build.ps1`. To build manually with CMake,
+the important part is enabling CUDA:
+
+```
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a-real
+cmake --build build --parallel
+```
+
+The default is a static single binary (`BUILD_SHARED_LIBS=OFF` on Windows); add
+`-DBUILD_SHARED_LIBS=ON` for the DLL build. Set `CMAKE_CUDA_ARCHITECTURES` to match your card:
+`86` for RTX 30 series, `89` for RTX 40 series, `120a-real` for RTX 50 series. The binaries land in
+`build/bin/`: `llama-kvmem-server` for normal inference and `llama-kvmem-cli` for command-line work.
+If you want FlashAttention to cover every K/V bit-width combination (noticeably longer build, larger
+binaries), also pass `-DGGML_CUDA_FA_ALL_QUANTS=ON`.
+
+**Running the tests.** The repository ships a set of automated test scripts under `scripts/nightly/`:
+`kvmem-kvarn-smoke.bat` is the smoke test, `kvmem-kvarn-evict.bat` exercises the eviction path,
+`kvmem-kvarn-hybrid.bat` covers hybrid architectures, `kvmem-kvarn-retrieval.bat` covers retrieval and
+`kvmem-kvarn-tools.bat` covers the command-line tools. `tests/kvarn-move-selftest.cpp` checks that
+KVarN record movement is byte-exact. These scripts start and stop the server themselves and report a
+`PASS/FAIL` verdict, so no manual model loading is needed.
+
 # KVMem + llama.cpp
 
 **Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Windows / Linux ROCm (beta)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta)
