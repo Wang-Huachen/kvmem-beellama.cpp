@@ -1,6 +1,27 @@
+## This fork: KVMem rebased onto beellama.cpp (KVarN cache compression)
+
+`Wang-Huachen/kvmem-beellama.cpp` is this project's working fork of `kvmem/kvmem-llama.cpp`.
+The base was rebased from `ggml-org/llama.cpp` to **`Anbeeld/beellama.cpp` v0.4.6 (`78af8326`)**, so
+KVMem's GPU working cache can live in **KVarN** record arenas and use KVarN's native
+record-consuming attention.
+
+**Everything below this section is the upstream KVMem documentation, unchanged.**
+
+- Base: beellama.cpp v0.4.6 (`78af8326`) — the pinned submodule replaces upstream's `llama.cpp`.
+- KVMem patch for the new base: `patches/llama-kvmem-current.patch`, applied by `scripts/apply-patches.sh`.
+- Regression drivers: `scripts/nightly/kvmem-kvarn-*.bat` (smoke / evict / hybrid / retrieval / tools),
+  plus `tests/kvarn-move-selftest.cpp`.
+- Cache types: KVarN is selected through the cache type itself, e.g.
+  `--cache-type-k kvarn6 --cache-type-v kvarn6`. Asymmetric widths are given per side
+  (`--cache-type-k kvarn6 --cache-type-v kvarn5`); the combined descriptor name
+  (`kvarn_k5v4_g128`) is not accepted by the CLI parsers.
+- Status: Qwen3.8-27B with `--kvmem` and `kvarn6` works end to end (record arena, virtual-slot record
+  addressing, MTP speculative decoding). Known limitations: the MTP draft cache still uses the stock
+  cache (a KVarN draft cache is rejected at startup), and a KVMem pool that does not fit in free VRAM
+  can drop long-context decode throughput until the process is restarted.
 # KVMem + llama.cpp
 
-**Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
+**Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Windows / Linux ROCm (beta)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta)
 
 **QQ community / QQ 交流群：1040777853**
 
@@ -8,7 +29,7 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [beellama.cpp](https://github.com/Anbeeld/beellama.cpp), a KVarN-capable fork of llama.cpp. beellama.cpp handles model loading, inference, quantization, Flash Attention and MTP; its KVarN cache types (`-ctk kvarn4` … `kvarn8`) are the reason this project is based on it. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
@@ -68,7 +89,12 @@ The project builds on llama.cpp's CUDA backend, with the platform above used for
 |---|---|---|
 | Windows x64 — CUDA 13.2.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Recommended **runtime** ZIP; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
 | Windows x64 — CUDA 12.9.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Alternative **runtime** ZIP; GPU targets 70/75/80/86/89/90/120a, including Volta. Quantizer is a separate optional ZIP. |
-| Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; no rc3 Linux/WSL rebuild is included. |
+| Linux / WSL2 x86_64 — CUDA 13.2.86 | [v0.16.0-rc3 tar.gz](https://github.com/kvmem/kvmem-llama.cpp/releases/download/v0.16.0-rc3/kvmem-v0.16.0-rc3-linux-x86_64-cuda13.2.86.tar.gz) | Runtime with CUDA libraries and both UIs; GPU targets 75/80/86/89/90/120a. Requires glibc 2.35+ and AVX2/FMA/F16C/BMI2. |
+| Linux / WSL2 x86_64 — CUDA 12.9.86 | [v0.16.0-rc3 tar.gz](https://github.com/kvmem/kvmem-llama.cpp/releases/download/v0.16.0-rc3/kvmem-v0.16.0-rc3-linux-x86_64-cuda12.9.86.tar.gz) | Runtime with CUDA libraries and both UIs; GPU targets 70/75/80/86/89/90/120a, including Volta. Requires glibc 2.35+ and AVX2/FMA/F16C/BMI2. |
+| Windows x64 — ROCm (beta) | [rc3-rocm-beta](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta) | Native HIP runtime ZIP for gfx1100/gfx1200/gfx1201 (RX 7900 / 9060 XT / 9070 series). |
+| Linux / WSL2 x86_64 — ROCm (beta) | [rc3-rocm-beta](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta) | Runtime tar.gz built on Ubuntu 24.04 with ROCm 7.2.x; other distributions may need a source build. |
+
+Linux rc3 packages use the same source as Windows and include independent `scripts/linux/start-iq3.sh` / `start-iq4.sh` launchers. CUDA Toolkit, Python and Node.js are not required to run these packages. See the [Linux / WSL2 quick start and validation notes](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) and verify downloads with [SHA256SUMS](https://github.com/kvmem/kvmem-llama.cpp/releases/download/v0.16.0-rc3/SHA256SUMS). The source-tree launcher commands below apply to source builds; use the packaged README for prebuilt launcher arguments.
 
 No model weights are bundled. For a Windows text-only setup, download the
 ready-made IQ3 `-mtp` model linked in the [Windows quick start](scripts/windows/README.md).
@@ -88,26 +114,26 @@ Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.
 
 Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone is insufficient, and the CUDA version shown by `nvidia-smi` describes driver support. After upgrading the Toolkit, configure a **new build directory** and rebuild the binaries. Updating the driver or replacing CUDA DLLs does not fix CUDA kernels already compiled into an old binary.
 
-An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements. That script initializes the pinned submodule and applies the maintained patch itself, so no bash is required on Windows; it builds into `build-win/bin`.
+An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
 
 ```bash
-git clone --recurse-submodules https://github.com/Wang-Huachen/kvmem-beellama.cpp.git
-cd kvmem-beellama.cpp
-git checkout master           # the beellama.cpp rebase lives on master until it is tagged
+git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
+cd kvmem-llama.cpp
+git checkout v0.16.0-rc3
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
 ```
 
-The submodule is [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp) at **v0.4.6 (`78af8326`)**, selected for its KVarN cache types. `scripts/apply-patches.sh` applies the single cumulative `patches/llama-kvmem-current.patch`; running it twice is safe (it reverse-checks first). The previous per-file queue (`0001`–`0004` plus the upgrade patches) targeted the old ggml-org/llama.cpp base and is kept under `patches/legacy-ggml-org/` for reference only — do **not** apply it to the beellama.cpp submodule. See [patches/README.md](patches/README.md).
+The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
 
-`scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models, and for the KVarN bit-width pairs). Binaries: `build/bin/llama-kvmem-server`. Expect a long first build: `FA_ALL_QUANTS=ON` expands to 169 standard FA pairs plus 36 KVarN bit-width pairs. On Windows, `scripts/windows/build.ps1` builds into `build-win/bin` instead.
+`scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 
 The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested RTX 5060 Ti. For another GPU, set `CMAKE_CUDA_ARCHITECTURES` to its appropriate target when running the script; other GPU targets have not been tested here.
 
 ## Browser chat
 
-The updated Windows rc3 runtime packages include both UIs: **full UI by default** at `share/kvmem/ui`, plus the lightweight UI at `share/kvmem/ui-lightweight`. The normal IQ3/IQ4 launch scripts enable the full UI automatically. To choose the lightweight UI, append `-UiDir '.\share\kvmem\ui-lightweight'` when running from the extracted package directory; `-NoUi` disables UI. Download the runtime ZIP again if you have the original lightweight-only rc3 package. Full UI does not add server-side tool execution or stream resumption to the KVMem backend.
+The updated Windows rc3 runtime packages include both UIs: **full UI by default** at `share/kvmem/ui`, plus the lightweight UI at `share/kvmem/ui-lightweight`. Their independent `start-iq3.ps1` / `start-iq4.ps1` scripts accept only `-Model`, `-Mmproj` and optional `-Gpu` (default `0`, index or UUID). They directly invoke the server and no longer use shared launch helpers. To choose the lightweight UI, edit `$UiDir` in the script to end in `share\kvmem\ui-lightweight`; to disable UI, replace `--webui` with `--no-ui`. Edit `$Port = 18200` to change the port. Download the runtime ZIP again for these updated scripts. Full UI does not add server-side tool execution or stream resumption to the KVMem backend. See the [Windows runtime guide](scripts/windows/README.md) for a complete launch command.
 
 The optional lightweight UI reuses llama.cpp's Markdown/code renderer, input components and browser-local history. It supports text and images, separate thinking effort/budget controls, stopping generation, and server-measured decode speed. It does not execute tools or manage model loading.
 
@@ -315,9 +341,9 @@ llama-kvmem-server -m model.gguf -ctk q8_0 -ctv q4_0
 ```
 
 The Linux recipes accept `--cache-type-k q8_0 --cache-type-v q4_0`;
-Windows recipes accept `-CacheTypeK q8_0 -CacheTypeV q4_0`. These optional
-settings override the recipe defaults for each component independently.
-Existing recipe defaults are unchanged.
+in the updated Windows rc3 runtime scripts, edit `-ctk q8_0 -ctv q4_0`
+directly in the script. The older source launcher also accepts
+`-CacheTypeK q8_0 -CacheTypeV q4_0`. Existing recipe defaults are unchanged.
 
 Flag compatibility does not imply support for every llama.cpp cache type or
 mixed K/V combination. These flags affect the main model; MTP cache precision
@@ -373,7 +399,7 @@ Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q
 --enable-thinking --reasoning-budget 4096
 ```
 
-IQ3 now defaults to CPU vision (`--no-mmproj-offload`) to leave more GPU memory for inference. Vision remains available. To explicitly use GPU vision, set `MMPROJ_DEVICE=gpu` on Linux/WSL or pass `-VisionDevice gpu` to the Windows launcher. Historical performance tables below retain their original projector placement.
+IQ3 now defaults to CPU vision (`--no-mmproj-offload`) to leave more GPU memory for inference. Vision remains available. To explicitly use GPU vision, set `MMPROJ_DEVICE=gpu` on Linux/WSL; in the updated Windows rc3 runtime script, replace `--no-mmproj-offload` with `--mmproj-offload`. Historical performance tables below retain their original projector placement.
 
 ### IQ4 27B — optional experimental comparison
 

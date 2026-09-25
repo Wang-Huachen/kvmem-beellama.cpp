@@ -1519,10 +1519,17 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         bool d2d_ok = n_res > 0;
         uint8_t * scratch = nullptr;
         if (d2d_ok) {
-            if (cudaMalloc(reinterpret_cast<void **>(&scratch),
-                           static_cast<size_t>(n_res) * scratch_stride) != cudaSuccess) {
+            const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch),
+                                                       static_cast<size_t>(n_res) * scratch_stride);
+            if (alloc_error != cudaSuccess) {
                 scratch = nullptr;
                 d2d_ok = false;
+                if (alloc_error == cudaErrorMemoryAllocation) {
+                    // A handled OOM must not stay sticky on this context: the host fallback
+                    // below still issues CUDA work, which would otherwise observe the old
+                    // error. (ported from upstream PR #49, 5b13811)
+                    (void) cudaGetLastError();
+                }
                 LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
             }
             kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
