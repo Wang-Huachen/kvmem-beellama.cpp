@@ -4,21 +4,13 @@
 **`beellama.cpp` v0.4.6（版本号 `78af8326`）**，因为只有 beellama 带 **KVarN** 这种 KV 缓存压缩格式。
 换过去之后，同样大小的显存能撑起更长的对话，这正是这次换引擎的目的。
 
-**下面全部是上游 KVMem 的原始说明，我们一个字都没改。**
-
 **怎么用**：参数和下面的说明完全一样，只有"缓存格式"这两项要留意。推荐写法是
 `--cache-type-k kvarn6 --cache-type-v kvarn6`，也就是 K 和 V 都压到 6 位；这是我们在 27B 上实测
 质量与显存最平衡的一档。想再省一点显存，可以给 K 和 V 用不同的压缩等级，但**必须写成两个参数**，
 例如 `--cache-type-k kvarn6 --cache-type-v kvarn5`；要是写成合并在一起的一个名字（比如
-`kvarn_k5v4_g128`），程序不认，会直接报错退出。另外提醒一句：压得越低越省显存，但质量会下降，
-其中 V 比 K 更敏感，所以不建议把 V 压到 4 位。
+`kvarn_k5v4_g128`），程序不认，会直接报错退出。另外提醒一句：压得越低越省显存，但质量会下降。
 
-**现在能用吗**：能用。我们用 **Qwen3.8-27B** 从头到尾跑通了长上下文问答和加速生成，
-并且验证过"开加速"与"不开加速"的输出是一致的。
-
-**两个已知问题**：第一，加速生成依赖的那份"草稿缓存"目前还不能用 KVarN，走的是普通缓存；
-要是硬给它开 KVarN，程序会在启动时直接拒绝，这是故意的，免得悄悄算错。第二，如果给 KVMem 分配的
-显存超过了显卡当时的空闲显存，**聊得越长生成越慢**，而且这个状态不会自己恢复，**只能重启程序**。
+**已知问题**："草稿缓存"目前还不能用 KVarN。
 
 **想自己编译**：先把仓库连同子模块一起拉下来（`git clone --recurse-submodules`），然后在仓库根目录
 用 Git Bash 或 WSL 执行 `bash scripts/apply-patches.sh`，它会把
@@ -49,8 +41,6 @@ This is a **fork of KVMem**. Upstream KVMem runs on `llama.cpp`; we swapped the 
 compression format for the KV cache. After the swap, the same amount of VRAM holds a longer
 conversation, which is exactly why the engine was replaced.
 
-**Everything below this point is the upstream KVMem documentation, unchanged.**
-
 **How to use it**: every option works as described below; only the two "cache format" options deserve
 attention. The recommended setting is `--cache-type-k kvarn6 --cache-type-v kvarn6`, i.e. both K and V
 compressed to 6 bits -- on the 27B model we measured this as the best balance between quality and VRAM.
@@ -58,18 +48,9 @@ If you want to save a little more VRAM you can give K and V different compressio
 **have to pass them as two separate options**, for example
 `--cache-type-k kvarn6 --cache-type-v kvarn5`. A combined name (such as `kvarn_k5v4_g128`) is not
 recognised and the program exits with an error. One more note: lower compression saves VRAM but costs
-quality, and V is more sensitive than K, so we would not push V down to 4 bits.
+quality.
 
-**Does it work today?** Yes. We ran **Qwen3.8-27B** through it end to end, for both long-context
-question answering and accelerated generation, and we verified that the output is identical with and
-without acceleration.
-
-**Two known issues.** First, the draft cache that accelerated generation relies on cannot use KVarN
-yet -- it falls back to the normal cache, and if you force KVarN on it the program refuses to start.
-That refusal is deliberate: it is better to stop than to silently compute the wrong thing. Second, if
-the VRAM you give KVMem is larger than the VRAM actually free on the card, generation gets slower the
-longer the conversation runs, and that state does not recover by itself -- you have to restart the
-program.
+**Known issue**: the draft cache cannot use KVarN yet.
 
 **Building it yourself.** Clone the repository together with its submodules
 (`git clone --recurse-submodules`), then from the repository root run `bash scripts/apply-patches.sh`
