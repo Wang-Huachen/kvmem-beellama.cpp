@@ -877,7 +877,8 @@ void llama_memory_kvmem::reset_policy() {
         raw_->clear();
     }
     if (runtime_) {
-        runtime_->truncate_to(0);
+        snapshot_records_above(0);
+    runtime_->truncate_to(0);
     }
     reset_slots();
     retrieval_pinned_ = false;
@@ -909,7 +910,8 @@ void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
         raw_->truncate_to(n_past);
     }
     if (runtime_ && n_past < runtime_->store().total_tokens()) {
-        runtime_->truncate_to(n_past);
+        snapshot_records_above(n_past);
+    runtime_->truncate_to(n_past);
     }
 }
 
@@ -1014,72 +1016,259 @@ void llama_memory_kvmem::assign_virtual_slots() {
         vorder_.resize(nblk, 0);
     }
 
-    // A block that just entered the GPU working set takes a new admission stamp.
-    // (Evicted blocks keep their stamp so they do not need to be re-stamped if they
-    // are still resident; a re-admitted block gets a strictly larger one.)
-    for (uint32_t id = 0; id < nblk; ++id) {
-        const int32_t slot = store.blocks()[id].gpu_slot;
-        if (slot >= 0 && vslot_[id] < 0) {
-            vorder_[id] = ++vorder_next_;
-        }
-    }
-
-    // Rank the resident blocks by admission order: oldest gets virtual 0, newest the
-    // highest number. This is the invariant KVarN needs -- an incomplete group is
-    // always the newest, so it must carry the largest index KVarN ever sees.
+    // ---- STICKY NUMBERING ----------------------------------------------------
+    // A resident block's number IS part of its KVarN record identity: the store kernel
+    // derives the record group from the cells we hand it (ggml-cuda/kvarn.cu:1002
+    // `group = kvarn_index_cell(idx) / KVAR_N_DIM`), so the number may only ever change
+    // together with the record BYTES. Re-ranking every resident on every call (oldest
+    // -> 0, newest -> highest, which is what this function used to do) moves no bytes
+    // and silently re-points every shifted block at another block's record -- measured
+    // with the KVMEM_VSLOT_SHIFT probe: shifted=91 live=96 in a single pass.
+    //
+    // What a number still has to satisfy (KVarN read side, ggml-cuda/kvarn.cu:2234-2242):
+    //   (a) unique, and < groups_per_stream (= pool_tokens / KVAR_N_GROUP == n_slots_);
+    //   (b) the sink (orig_pos_start == 0) keeps 0 -- group 0 is never sealed (the store
+    //       kernel seals only `group > 0`) and is always read from F16 stage slot 0, and
+    //       block_records_snapshotable() treats number 0 as the sink;
+    //   (c) the partially filled block has to sit inside the fp16 tail window. Its group
+    //       has no sealed record, so the read side must take it from the fp16 stage -- and
+    //       the read side decides record-vs-stage from the GROUP NUMBER ALONE
+    //       (ggml-cuda/kvarn.cu:2251-2253: from_stage = group == 0 || (group <= live_group
+    //       && group + tail_groups - 1 >= live_group)). The explicit-staging escape hatch
+    //       (llama_kvarn_encode_stage_cell in set_input_kvarn_mat_idxs) is NOT reached in
+    //       this configuration: mat_idxs stays nullptr, so the native FA path reads
+    //       stored->src[1] and never consults that encoding. The window rule is therefore
+    //       enforced explicitly by the tail-window correction below, and it must stay.
+    const uint32_t nnum = n_slots_;
+    std::vector<uint8_t> num_used(nnum, 0);
     std::vector<uint32_t> live;
     live.reserve(nblk);
+    // Blocks whose number the tail-window correction changes ON PURPOSE (its record bytes
+    // travel with the number), so the drift probe at the end must not count them.
+    std::vector<uint32_t> corrected_ids;
     for (uint32_t id = 0; id < nblk; ++id) {
-        if (store.blocks()[id].gpu_slot >= 0 && store.blocks()[id].n_tokens > 0) {
-            live.push_back(id);
+        const auto & b = store.blocks()[id];
+        if (b.gpu_slot < 0 || b.n_tokens == 0) {
+            vslot_[id] = -1;                    // no longer in the working set: free it
+            continue;
         }
-    }
-    std::sort(live.begin(), live.end(),
-              [&](uint32_t a, uint32_t b) { return vorder_[a] < vorder_[b]; });
-    for (size_t i = 0; i < live.size(); ++i) {
-        vslot_[live[i]] = static_cast<int32_t>(i);
+        live.push_back(id);
+        const bool bad_range = vslot_[id] < 0 || uint32_t(vslot_[id]) >= nnum;
+        const bool bad_dup   = !bad_range && num_used[uint32_t(vslot_[id])] != 0;
+        if (bad_range || bad_dup) {
+            if (vslot_[id] >= 0 && perf_.enabled) {
+                // An unnumbered resident is normal (it is about to be allocated one). A
+                // bound/duplicate violation is not: the block's record sits in a group it
+                // no longer names, so its rows would silently read as someone else's.
+                fprintf(stderr, "KVMEM_VSLOT_DROP block=%u num=%d nnum=%u dup=%d\n",
+                        id, vslot_[id], nnum, bad_dup ? 1 : 0);
+            }
+            vslot_[id] = -1;                    // unnumbered, out of range, or duplicated
+            continue;
+        }
+        num_used[uint32_t(vslot_[id])] = 1;
     }
 
-    // The partially filled block is the one KVMem keeps writing into, so it has to end
-    // up with the HIGHEST virtual number (the invariant checked below in
-    // prepare_ubatches()). Admission order alone is NOT a reliable proxy for that: the
-    // tail block gets its stamp when its first token arrives, and any eviction /
-    // re-admission churn after that hands other residents a newer stamp -- which pushes
-    // the tail *down* the ranking. Observed with a pool small enough to churn
-    // (--kvmem-budget 12288, 30k-token prompt + retrieval):
-    //   "partial block 240 carries virtual slot 14 but the highest is 95"
-    // KVarN would then read that group from neither the F16 stage (it is not inside
-    // [live_group - (tail_groups - 1), live_group]) nor a record (it is not sealed), and
-    // silently attend to zeros. Force the tail to the top by swapping it with whoever
-    // holds the top number: that block is complete, so `group < live_group` is still
-    // true for it and its sealed record keeps serving it.
-    {
-        int32_t partial = -1;
-        int32_t top     = -1;
-        for (uint32_t id = 0; id < nblk; ++id) {
-            const auto & b = store.blocks()[id];
-            if (b.gpu_slot < 0 || b.n_tokens == 0 || vslot_[id] < 0) {
-                continue;
-            }
-            if (b.n_tokens < block_tokens_) {
-                partial = vslot_[id];
-            }
-            top = std::max(top, vslot_[id]);
+    for (uint32_t id : live) {
+        if (vslot_[id] >= 0) {
+            continue;
         }
-        if (partial >= 0 && top > partial) {
-            for (uint32_t id = 0; id < nblk; ++id) {
-                if (vslot_[id] == top) {
-                    vslot_[id] = partial;
-                } else if (vslot_[id] == partial) {
-                    vslot_[id] = top;
+        // A resident without a number yet. restore_records()/occupy_block_cells() run
+        // after this function (in prepare_ubatches()), so a revived block's record write
+        // and its cell registration both see the number picked here.
+        const bool sink = store.blocks()[id].orig_pos_start == 0;
+        uint32_t pick = nnum;
+        for (uint32_t c = sink ? 0u : 1u; c < nnum; ++c) {
+            if (!num_used[c]) {
+                pick = c;
+                break;
+            }
+        }
+        if (pick == nnum) {
+            // Unreachable while the working-set budget keeps fewer blocks resident than
+            // n_slots_ (the pool always leaves slots free). Two blocks sharing a number
+            // would silently alias them onto one record, so refuse instead of guessing.
+            LLAMA_LOG_ERROR("%s: no free virtual slot for block %u (%zu resident, %u slots)\n",
+                            __func__, id, live.size(), nnum);
+            continue;
+        }
+        vslot_[id] = int32_t(pick);
+        num_used[pick] = 1;
+    }
+
+    // ---- THE FILLING BLOCK MUST SIT IN THE FP16 TAIL WINDOW -------------------
+    // The native KVarN attention path does NOT use an index tensor: the view op falls
+    // back to `stored->src[1]` with read_indirect = 0 (measured on 27B/kvarn6:
+    // KVMEM_KVARN_VIEW mat_idxs=0 read_indirect=0 native=1). The kernel therefore takes
+    // the record group from the CELL INDEX itself (group = cell / 128 = virtual slot) and
+    // decides record-vs-stage from `live_group` alone (ggml-cuda/kvarn.cu:2251-2253):
+    //   from_stage  = group == 0 || (group <= live_group && group + tail_groups - 1 >= live_group)
+    //   from_record = !from_stage && group < live_group && group < groups_per_stream
+    // A block that is still filling has NO sealed record, so it has to fall inside that
+    // window -- otherwise it reads a group nothing ever wrote, i.e. zeros, and the newest
+    // tokens (the question that was just asked) become invisible. Numbers stay sticky, so
+    // the only block that may move is the one still filling; the block it displaces is
+    // complete and keeps working -- but its RECORD has to travel with its number, which is
+    // exactly what the old swap-only version forgot to do.
+    {
+        const uint32_t tail_groups = kvarn_->get_tail_groups();
+        const uint32_t window = tail_groups > 0 ? tail_groups - 1 : 0;
+        int32_t  partial_id  = -1;
+        uint32_t partial_ord = 0;
+        int32_t  max_num     = -1;
+        uint32_t n_partial   = 0;
+        for (uint32_t id : live) {
+            max_num = std::max(max_num, vslot_[id]);
+            const auto & b = store.blocks()[id];
+            if (b.n_tokens < block_tokens_) {
+                ++n_partial;
+                if (b.orig_pos_start >= partial_ord) {
+                    partial_ord = b.orig_pos_start;
+                    partial_id  = int32_t(id);
+                }
+            }
+        }
+        if (n_partial > 1 && perf_.enabled) {
+            // Only the fp16 tail can serve more than one group, so at most tail_groups
+            // filling blocks can be readable at once. More than one is a bookkeeping bug
+            // (partial blocks are pinned against eviction) -- say so instead of letting
+            // the extra ones silently attend to zeros.
+            fprintf(stderr, "KVMEM_MULTI_PARTIAL n=%u live=%zu tail_groups=%u\n",
+                    n_partial, live.size(), tail_groups);
+        }
+        if (partial_id >= 0 && max_num >= 0) {
+            const uint32_t p_old = uint32_t(vslot_[partial_id]);
+            if (p_old > 0 && p_old + window < uint32_t(max_num)) {
+                // The victim must share the partial block's F16 stage slot, because the
+                // stage rows travel with the group NUMBER (slot(g) = g == 0 ? 0 :
+                // 1 + ((g-1) % tail_groups)) and not with the cells we register. It also
+                // has to be a COMPLETE block: those are read from their record, so the
+                // stage no longer serves them.
+                int32_t  victim_id  = -1;
+                uint32_t victim_num = 0;
+                uint32_t free_cand  = nnum;     // inside the window, unused, same stage slot
+                for (uint32_t cand = uint32_t(max_num); cand > p_old; --cand) {
+                    if (cand == 0 || cand + window < uint32_t(max_num)) {
+                        break;
+                    }
+                    if ((cand - 1u) % tail_groups != (p_old - 1u) % tail_groups) {
+                        continue;
+                    }
+                    if (!num_used[cand]) {
+                        free_cand = cand;
+                        break;
+                    }
+                    for (uint32_t id : live) {
+                        if (vslot_[id] == int32_t(cand) &&
+                                store.blocks()[id].n_tokens == block_tokens_) {
+                            victim_id  = int32_t(id);
+                            victim_num = cand;
+                            break;
+                        }
+                    }
+                    if (victim_id >= 0) {
+                        break;
+                    }
+                }
+                if (free_cand != nnum) {
+                    // The window number is free: the filling block just takes it. Its
+                    // record does not exist yet, so there is nothing to move -- only its
+                    // cells have to name the new group. The stage slot is unchanged by
+                    // construction (same residue), so its already written rows stay put.
+                    num_used[p_old]     = 0;
+                    num_used[free_cand] = 1;
+                    vslot_[partial_id]  = int32_t(free_cand);
+                    corrected_ids.push_back(uint32_t(partial_id));
+                    const auto & pb = store.blocks()[partial_id];
+                    kv_->seq_rm_logical(0, pb.orig_pos_start, pb.orig_pos_end());
+                    occupy_block_cells(uint32_t(partial_id));
+                    if (perf_.enabled) {
+                        fprintf(stderr, "KVMEM_TAIL_FREE partial=%d %u->%u live=%zu\n",
+                                partial_id, p_old, free_cand, live.size());
+                    }
+                } else if (victim_id >= 0) {
+                    vslot_[partial_id] = int32_t(victim_num);
+                    vslot_[victim_id]  = int32_t(p_old);
+                    corrected_ids.push_back(uint32_t(victim_id));
+                    corrected_ids.push_back(uint32_t(partial_id));
+                    // The record bytes are this block's identity -- move them with it.
+                    // move_record_group() does not synchronise, so fence first: the
+                    // previous graph may still be writing this arena.
+                    cudaDeviceSynchronize();
+                    for (uint32_t il = 0; il < n_layer_; ++il) {
+                        // Only layers that actually carry KVarN records (the same filter
+                        // snapshot_records()/restore_records() use): recurrent and MTP
+                        // layers have no record tensors and move_record_group() rejects
+                        // them.
+                        ggml_tensor * kt = kvarn_->get_records(static_cast<int32_t>(il), false);
+                        ggml_tensor * vt = kvarn_->get_records(static_cast<int32_t>(il), true);
+                        if (!kt || !vt) {
+                            continue;
+                        }
+                        if (!kvarn_->move_record_group(static_cast<int32_t>(il), victim_num, p_old)) {
+                            LLAMA_LOG_ERROR("%s: record move for block %d (layer %u) %u->%u "
+                                    "failed; the block would read a foreign record\n",
+                                    __func__, victim_id, il, victim_num, p_old);
+                            GGML_ABORT("%s: record move failed", __func__);
+                        }
+                    }
+                    cudaDeviceSynchronize();
+                    // Both blocks' cells name the group their rows are read at.
+                    for (int32_t id : { victim_id, partial_id }) {
+                        const auto & b = store.blocks()[id];
+                        kv_->seq_rm_logical(0, b.orig_pos_start, b.orig_pos_end());
+                    }
+                    occupy_block_cells(uint32_t(victim_id));
+                    occupy_block_cells(uint32_t(partial_id));
+                    if (perf_.enabled) {
+                        fprintf(stderr, "KVMEM_TAIL_SWAP partial=%d %u->%u victim=%d %u->%u live=%zu\n",
+                                partial_id, p_old, victim_num, victim_id, victim_num, p_old, live.size());
+                    }
                 }
             }
         }
     }
-    // Blocks that left the working set must not keep a virtual number.
-    for (uint32_t id = 0; id < nblk; ++id) {
-        if (store.blocks()[id].gpu_slot < 0) {
-            vslot_[id] = -1;
+
+    // ---- STABILITY PROBE (KVMEM_PERF=1) --------------------------------------
+    // KVarN keys its record arena by the group number it derives from the cells we
+    // hand it (group = cell / 128), and the read side decides record-vs-stage from
+    // the group number alone (ggml-cuda/kvarn.cu:2132-2154,2235-2253:
+    // `completed = group < live_group`, no metadata flag involved). So the block ->
+    // group mapping has to be STABLE: if a resident block's number changes while its
+    // record bytes stay in the old group, attention silently reads another block's
+    // rows. This function re-ranks every resident block by admission stamp on every
+    // call, which shifts every number below an evicted block's rank. Count that.
+    if (perf_.enabled) {
+        static std::unordered_map<uint32_t, int32_t> prev_vslot;
+        uint32_t shifted = 0;
+        uint32_t first_id = 0xFFFFFFFFu;
+        int32_t  first_from = 0, first_to = 0;
+        // At most two ids are corrected on purpose (the filling block, plus the block it
+        // displaces). Those moved their bytes; everyone else changing number did not.
+        const uint32_t corr_a = corrected_ids.size() > 0 ? corrected_ids[0] : 0xFFFFFFFFu;
+        const uint32_t corr_b = corrected_ids.size() > 1 ? corrected_ids[1] : 0xFFFFFFFFu;
+        for (uint32_t id = 0; id < nblk; ++id) {
+            if (vslot_[id] < 0) {
+                // Not resident: a later re-admission legitimately takes a NEW number
+                // (its record was snapshotted and is restored into that number), so
+                // forget the old one instead of reporting it as a shift.
+                prev_vslot.erase(id);
+                continue;
+            }
+            const auto it = prev_vslot.find(id);
+            if (it != prev_vslot.end() && it->second != vslot_[id] && id != corr_a && id != corr_b) {
+                ++shifted;
+                if (first_id == 0xFFFFFFFFu) {
+                    first_id = id;
+                    first_from = it->second;
+                    first_to = vslot_[id];
+                }
+            }
+            prev_vslot[id] = vslot_[id];
+        }
+        if (shifted) {
+            fprintf(stderr, "KVMEM_VSLOT_SHIFT shifted=%u live=%zu first=%u %d->%d\n",
+                    shifted, live.size(), first_id, first_from, first_to);
         }
     }
 
@@ -1289,7 +1478,16 @@ bool llama_memory_kvmem::gpu_kv_already_resident(uint32_t block_id) const {
         return false;
     }
     const llama_kv_cells & cells = kv_->get_cells(0);
-    const uint32_t idx = static_cast<uint32_t>(b.gpu_slot) * block_tokens_;
+    // The cells KVMem hands to the arena are indexed by the VIRTUAL slot, not by the
+    // physical pool slot: occupy_in()/kvmem_fill_slot_info() both write
+    // `cell = virtual_slot_of(block_id) * block_tokens_ + t`, and KVarN derives its
+    // record group from exactly those cells. Upstream could use b.gpu_slot here
+    // because upstream has no virtual numbering; with the virtual-slot table the two
+    // only agree until something is evicted, so this checked the wrong cell and
+    // answered "already resident" for blocks whose rows were gone -- the caller then
+    // skipped the stage-in and the model could not read them (KVMEM_RETR_SUM showed
+    // n_skip=35/50/51 against n_stage_in=77/8/5). Same convention as 32d08e4.
+    const uint32_t idx = virtual_slot_of(block_id) * block_tokens_;
     if (idx >= cells.size() || cells.is_empty(idx)) {
         return false;
     }
@@ -2018,7 +2216,8 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
                     n_new_tokens, resident_tokens(), kv_size_, incoming);
         } catch (const std::exception & e) {
             LLAMA_LOG_ERROR("%s: KVMem reselect failed: %s\n", __func__, e.what());
-            runtime_->truncate_to(t0);
+            snapshot_records_above(t0);
+    runtime_->truncate_to(t0);
             return false;
         }
     }
@@ -2042,7 +2241,8 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
             }
         } catch (const std::exception & e) {
             LLAMA_LOG_ERROR("%s: KVMem reselect failed: %s\n", __func__, e.what());
-            runtime_->truncate_to(t0);
+            snapshot_records_above(t0);
+    runtime_->truncate_to(t0);
             return false;
         }
     } else {
@@ -2055,7 +2255,8 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
                 // Pinned retrieval will not evict the working set. gen_reserve
                 // exhaustion is a known v1 limit (see docs/architecture.md).
                 LLAMA_LOG_ERROR("%s: no free GPU slot for block %u\n", __func__, id);
-                runtime_->truncate_to(t0);
+                snapshot_records_above(t0);
+    runtime_->truncate_to(t0);
                 return false;
             }
             store.set_block_gpu_slot(id, slot);
@@ -2066,7 +2267,8 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     for (uint32_t id : incoming) {
         if (id < store.block_count() && store.blocks()[id].gpu_slot < 0) {
             LLAMA_LOG_ERROR("%s: incoming block %u was not placed on GPU\n", __func__, id);
-            runtime_->truncate_to(t0);
+            snapshot_records_above(t0);
+    runtime_->truncate_to(t0);
             return false;
         }
     }
@@ -2109,12 +2311,23 @@ bool llama_memory_kvmem::prepare_ubatches(
     // assigned just above. Before this point the block is not in vslot_ yet, so
     // virtual_slot_of() silently answers with the PHYSICAL pool slot -- measured 91/91
     // wrong groups before this flush existed (wrote 20, read 440).
+    if (perf_.enabled) fprintf(stderr, "KVMEM_REST_QUEUE pending=%zu\n", g_rec_pending_restore.size());
     if (!g_rec_pending_restore.empty()) {
         const std::vector<uint32_t> pending = g_rec_pending_restore;
         g_rec_pending_restore.clear();
         for (uint32_t bid : pending) {
             if (restore_records(bid)) {
                 occupy_block_cells(bid);
+                // Acceptance probe: remember the group the bytes went into so the next
+                // numbering pass can report whether the batch reads that same group.
+                // (Without this the probe in assign_virtual_slots() reads a map nothing
+                // ever fills -- it silently reported nothing instead of MISMATCH.)
+                if (perf_.enabled) {
+                    g_rec_written_group[bid] = uint32_t(virtual_slot_of(bid));
+                    const auto & rb = runtime_->store().blocks()[bid];
+                    fprintf(stderr, "KVMEM_REST_DONE bid=%u vslot=%d orig=%u n=%u\n",
+                            bid, int(virtual_slot_of(bid)), rb.orig_pos_start, rb.n_tokens);
+                }
                 continue;
             }
             if (block_records_snapshotable(bid)) {
@@ -2142,40 +2355,33 @@ bool llama_memory_kvmem::prepare_ubatches(
         // number -- **as KVarN sees it**, which is the virtual number, not the
         // physical slot. This check therefore reads virtual_slot_of().
         //
-        // An incomplete group is never sealed into a record, so the read side serves
-        // it from the F16 stage -- but only while it is the live group
-        // (fattn-mma-kvarn.cuh: `group_from_stage` is `group==0 ||
-        // (group==live_group && live_pos < 127)`, and `group_from_record` requires
-        // `completed`, i.e. `group < live_group || live_pos == 127`). A partial group
-        // that is NOT the live group falls through both and the kernel reads zeros --
-        // silently wrong attention, worse than a crash.
-        //
-        // `live_group` on the read side is the numeric MAXIMUM of the indices the
-        // arena was handed (kvarn.cu:2149), so the virtual numbering
-        // (assign_virtual_slots()) is what makes this hold regardless of where KVMem
-        // physically parks the block. This check is the backstop: refuse to run rather
-        // than let attention read zeros for a group that is in neither the F16 stage
-        // nor a record.
+        // An incomplete group is never sealed into a record, so it is handed to KVarN as
+        // explicitly staged (set_input_kvarn_mat_idxs) and every FA load path then reads
+        // it from the F16 stage no matter what number it holds:
+        // `from_stage = explicitly_staged` (fattn-mma-kvarn-load.cuh:87-90). The former
+        // requirement -- "the partial block has to own the highest virtual number" -- was
+        // the only way to reach the stage under the old encoding, and satisfying it by
+        // swapping numbers is exactly what silently re-pointed blocks at each other's
+        // records. What remains is that the block has to HAVE a number, because that
+        // number is the only group KVarN can address for it: refuse to run rather than
+        // attend to an unaddressable group.
         uint32_t partial_id = ~0u;
         int32_t  partial_slot = -1;
-        int32_t  max_slot = -1;
         auto & st = runtime_->store();
         for (const auto & b : st.blocks()) {
             if (b.gpu_slot < 0 || b.n_tokens == 0) {
                 continue;
             }
-            max_slot = std::max(max_slot, static_cast<int32_t>(virtual_slot_of(b.block_id)));
             if (b.n_tokens < block_tokens_) {
                 partial_id = b.block_id;
                 partial_slot = static_cast<int32_t>(virtual_slot_of(b.block_id));
             }
         }
-        if (partial_id != ~0u && partial_slot != max_slot) {
-            LLAMA_LOG_ERROR("%s: partial block %u carries virtual slot %d but the highest "
-                    "is %d; KVarN would read that group from neither the F16 stage "
-                    "nor a record and silently attend to zeros\n",
-                    __func__, partial_id, partial_slot, max_slot);
-            GGML_ABORT("%s: partial block is not in the live slot", __func__);
+        if (partial_id != ~0u && partial_slot < 0) {
+            LLAMA_LOG_ERROR("%s: partial block %u carries no virtual slot; KVarN would "
+                    "have no group to address for it\n",
+                    __func__, partial_id);
+            GGML_ABORT("%s: partial block has no virtual slot", __func__);
         }
     }
     pos_queue_.clear();
@@ -2391,7 +2597,8 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     if (!replay_ &&
         seq_id <= 0 && p0 <= 0 &&
         (p1 < 0 || p1 >= static_cast<llama_pos>(runtime_->store().total_tokens()))) {
-        runtime_->truncate_to(0);
+        snapshot_records_above(0);
+    runtime_->truncate_to(0);
         reset_slots();
         retrieval_pinned_ = false;
     }
@@ -3979,6 +4186,28 @@ void llama_memory_kvmem::snapshot_records(uint32_t block_id) {
     }
 }
 
+// KVMEM-FIX(2026-09-26): KVarN keeps the KV in the arena's RECORD groups, and a slot
+// handed to another block destroys those bytes for good (see apply_plan_to_kv()).
+// The planner path snapshots before it stages a block out, but the store's own
+// eviction (truncate) and the pressure/spill paths did not -- those blocks then had
+// no mirror, so restore_records() silently returned false on re-admission and the
+// batch read the previous occupant's records. Snapshot everything that is about to
+// be dropped, BEFORE the truncate can hand the slots to somebody else.
+void llama_memory_kvmem::snapshot_records_above(uint32_t token_pos) {
+    if (!kvarn_) {
+        return;
+    }
+    auto & store = runtime_->store();
+    for (const auto & b : store.blocks()) {
+        if (b.gpu_slot < 0 || b.n_tokens == 0) {
+            continue;
+        }
+        if ((uint64_t) b.orig_pos_end() > (uint64_t) token_pos) {
+            snapshot_records(b.block_id);
+        }
+    }
+}
+
 bool llama_memory_kvmem::restore_records(uint32_t block_id) {
     if (!kvarn_ || block_id >= runtime_->store().block_count()) {
         return false;
@@ -4368,6 +4597,29 @@ void llama_memory_kvmem::score_retrieval() {
     }
     store.set_retrieval_scores(scores);
 
+    // KVMEM_SCORE_TRACE=1: dump every block's score, ranked. The selector keeps only
+    // `select_budget` blocks, so "the block holding the needle is absent from the
+    // selection" has two very different explanations: the block ranked outside the
+    // budget (the metric could not separate it) or it ranked inside and the selector
+    // dropped it (a selector bug). Only the ranking tells them apart.
+    //
+    // Note what this metric can and cannot see: the score is a normalised dot product
+    // between the query's summed Q and the block's MEAN K, so a distinctive passage
+    // that occupies one token of a 128-token block contributes ~1/128 of the block's
+    // signal. A one-line needle is therefore not expected to outrank ordinary blocks.
+    if (std::getenv("KVMEM_SCORE_TRACE") && nblk > 0) {
+        std::vector<uint32_t> order(nblk);
+        for (uint32_t i = 0; i < nblk; ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return std::fabs(scores[a]) > std::fabs(scores[b]);
+        });
+        fprintf(stderr, "KVMEM_SCORE n=%u rank(block:score)", nblk);
+        for (uint32_t i = 0; i < nblk; ++i) {
+            fprintf(stderr, " %u:%.4f", order[i], scores[order[i]]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     // ---- health report ---------------------------------------------------------
     retr_runs_++;
     retr_blocks_ = nblk;
@@ -4487,7 +4739,16 @@ bool llama_memory_kvmem::gpu_kv_complete(uint32_t id, const llama_kv_cache * cac
     const auto & b = store().blocks()[id];
     if (b.gpu_slot < 0 || b.tier != kvmem::KvTier::GPU || b.in_flight || !b.n_tokens) return false;
     const auto & cells = cache->get_cells(0);
-    const uint64_t first = (uint64_t) b.gpu_slot * block_tokens_;
+    // The cell index must be the VIRTUAL number, exactly as occupy_in() writes it
+    // (`cell = virtual_slot_of(block_id) * block_tokens_ + t`) -- not the physical
+    // pool slot. alloc_slot() hands out the lowest free slot, so the two numberings
+    // diverge as soon as anything is evicted, and this then read another block's
+    // cells (or empty ones), reported every resident block as incomplete and made
+    // attention_view() invalid. That in turn disabled the can_append() proof the
+    // server needs before it will keep or apply a retrieval selection.
+    // The MTP follower is addressed by the same numbering: it shares this store and
+    // indexes its own cells with virtual_slot_of() (llama-memory-kvmem-mtp.cpp:644).
+    const uint64_t first = (uint64_t) virtual_slot_of(id) * block_tokens_;
     if (first + b.n_tokens > cells.size() || b.orig_pos_end() > row_positions_.size()) return false;
     for (uint32_t i = 0; i < b.n_tokens; ++i) {
         const uint32_t cell = first + i, row = b.orig_pos_start + i;
@@ -4500,28 +4761,106 @@ bool llama_memory_kvmem::gpu_kv_complete(uint32_t id, const llama_kv_cache * cac
     return true;
 }
 
+namespace {
+// Diagnostic only (KVMEM_PERF=1). Records why the most recent attention_view()
+// came back invalid, so can_append() can print the exact sub-condition next to
+// its coverage_or_layout failure. Global rather than a member to avoid touching
+// the public view struct.
+char g_view_invalid_detail[384] = {0};
+}  // namespace
+
 llama_kvmem_attention_view llama_memory_kvmem::attention_view(bool canonical) const {
     llama_kvmem_attention_view view;
     view.epoch = attention_epoch_;
     view.rows = store_n_tokens();
-    view.valid = kv_ && runtime_ && store().config().optimize_stage_in;
-    uint32_t resident_rows = 0;
+    const bool gate_ok = kv_ && runtime_ && store().config().optimize_stage_in;
+    view.valid = gate_ok;
+    const uint32_t nblk = store().block_count();
+    uint32_t resident_rows = 0, n_resident = 0, n_kv_bad = 0, n_mtp_bad = 0;
+    uint32_t n_phys_bad = 0, max_vslot = 0;
+    uint32_t first_kv_bad = 0xFFFFFFFFu, first_mtp_bad = 0xFFFFFFFFu, first_phys_bad = 0xFFFFFFFFu;
+    std::vector<uint8_t> vslot_seen(nblk, 0);
     for (const auto & b : store().blocks()) {
         if (b.gpu_slot < 0 || !b.n_tokens) continue;
         resident_rows += b.n_tokens;
-        if ((canonical && b.gpu_slot != (int32_t) view.blocks.size()) || !gpu_kv_complete(b.block_id, kv_) ||
-                (mtp_ && !gpu_kv_complete(b.block_id, mtp_->get_kv()))) view.valid = false;
+        // Upstream compared b.gpu_slot against the running position, which encodes
+        // "the resident blocks fill the pool from slot 0, in store order". That held
+        // for the row cache because the store WAS the pool. It cannot hold for a
+        // working-set pool: alloc_slot() hands out the lowest free slot, so after any
+        // eviction the physical layout is a permutation of the store order. The
+        // invariant the record arena actually needs is stated over the VIRTUAL
+        // numbers -- occupy_in()/kvmem_fill_slot_info() register cells at
+        // virtual_slot_of()*block_tokens_, assign_virtual_slots() re-ranks every
+        // batch, and KVarN infers "which group is still being written" from the
+        // numeric maximum of the indices it is handed. So prove THAT: the resident
+        // blocks must carry virtual numbers exactly 0..n-1.
+        // Measured on the 27B (KVarN, budget 12288): the physical check rejected
+        // 91/92 healthy blocks while the arena itself was consistent.
+        const uint32_t v = virtual_slot_of(b.block_id);
+        if (v < nblk && !vslot_seen[v]) vslot_seen[v] = 1;
+        max_vslot = std::max(max_vslot, v);
+        const bool kv_bad  = !gpu_kv_complete(b.block_id, kv_);
+        const bool mtp_bad = mtp_ && !gpu_kv_complete(b.block_id, mtp_->get_kv());
+        // Physical-slot counting is kept only as a diagnostic reference.
+        if (b.gpu_slot != (int32_t) n_resident) {
+            ++n_phys_bad;
+            if (first_phys_bad == 0xFFFFFFFFu) first_phys_bad = b.block_id;
+        }
+        if (kv_bad)  { ++n_kv_bad;  if (first_kv_bad  == 0xFFFFFFFFu) first_kv_bad  = b.block_id; }
+        if (mtp_bad) { ++n_mtp_bad; if (first_mtp_bad == 0xFFFFFFFFu) first_mtp_bad = b.block_id; }
+        if (kv_bad || mtp_bad) view.valid = false;
+        ++n_resident;
         view.blocks.push_back(b.block_id);
+    }
+    if (canonical) {
+        bool dense = true;
+        for (uint32_t i = 0; i < n_resident; ++i) {
+            if (i >= nblk || !vslot_seen[i]) { dense = false; break; }
+        }
+        if (!dense) view.valid = false;
     }
     // Extra live cells (for example an untrimmed speculative tail) are also
     // part of attention. A proof must account for them, not just known blocks.
-    if (kv_ && kv_->get_cells(0).get_used() != resident_rows) view.valid = false;
-    if (mtp_ && mtp_->get_kv()->get_cells(0).get_used() != resident_rows) view.valid = false;
+    const uint64_t kv_used  = kv_ ? (uint64_t) kv_->get_cells(0).get_used() : 0;
+    const uint64_t mtp_used = mtp_ ? (uint64_t) mtp_->get_kv()->get_cells(0).get_used() : 0;
+    if (kv_ && kv_used != resident_rows) view.valid = false;
+    if (mtp_ && mtp_used != resident_rows) view.valid = false;
+    if (perf_.enabled) {
+        snprintf(g_view_invalid_detail, sizeof(g_view_invalid_detail),
+                 "valid=%d gate=%d kv=%d runtime=%d opt_stage_in=%d | resident=%u rows=%u cells_size=%u "
+                 "used_max_p1=%u | slots=%u free=%zu max_vslot=%u | kv_incomplete=%u(first=%u) "
+                 "mtp_incomplete=%u(first=%u) phys_bad=%u(first=%u) | kv_used=%llu(delta=%lld) "
+                 "mtp_used=%llu(delta=%lld) canonical=%d",
+                 view.valid ? 1 : 0, gate_ok ? 1 : 0, kv_ ? 1 : 0, runtime_ ? 1 : 0,
+                 store().config().optimize_stage_in ? 1 : 0,
+                 n_resident, resident_rows,
+                 kv_ ? kv_->get_cells(0).size() : 0u,
+                 kv_ ? kv_->get_cells(0).used_max_p1() : 0u,
+                 n_slots_, free_slots_.size(), max_vslot,
+                 n_kv_bad, first_kv_bad, n_mtp_bad, first_mtp_bad, n_phys_bad, first_phys_bad,
+                 (unsigned long long) kv_used, (long long) ((int64_t) kv_used - (int64_t) resident_rows),
+                 (unsigned long long) mtp_used, (long long) ((int64_t) mtp_used - (int64_t) resident_rows),
+                 canonical ? 1 : 0);
+    }
     return view;
 }
 
 bool llama_memory_kvmem::can_append(uint32_t end, uint32_t generation_rows, bool all_history, std::string & reason) const {
-    auto fail = [&](const char * why) { reason = why; return false; };
+    auto emit = [&](const char * what) {
+        if (!perf_.enabled) return;
+        if (g_view_invalid_detail[0]) {
+            fprintf(stderr, "KVMEM_CANAPPEND_%s reason=%s end=%u store_rows=%u view={%s}\n",
+                    what, reason.c_str(), end, store_n_tokens(), g_view_invalid_detail);
+        } else {
+            fprintf(stderr, "KVMEM_CANAPPEND_%s reason=%s end=%u store_rows=%u\n",
+                    what, reason.c_str(), end, store_n_tokens());
+        }
+    };
+    auto fail = [&](const char * why) {
+        reason = why;
+        emit("FAIL");
+        return false;
+    };
     if (!runtime_ || !kv_ || end < store_n_tokens()) return fail("invalid_boundary");
     const auto view = attention_view(all_history);
     if (!view.valid) return fail("coverage_or_layout");
@@ -4541,6 +4880,7 @@ bool llama_memory_kvmem::can_append(uint32_t end, uint32_t generation_rows, bool
     }
     if (needed > free_slots_.size()) return fail("insufficient_slots");
     reason = all_history ? "all_resident" : "same_query";
+    emit("OK");
     return true;
 }
 
@@ -4578,6 +4918,26 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval() {
     selection.epoch = attention_epoch_;
     selection.rows = store_n_tokens();
     selection.blocks = runtime_->preview_reselect(retrieval_mandatory());
+    // KVMEM-DIAG(2026-09-26): 打印“选中了哪些块”，用于区分
+    // ①针所在的块没被选中 vs ②选中了但没真正回灌。只在 KVMEM_SEL_TRACE=1 时打。
+    if (std::getenv("KVMEM_SEL_TRACE")) {
+        const auto & sb = selection.blocks;
+        const uint32_t nb = (uint32_t) ((store_n_tokens() + block_tokens_ - 1) / block_tokens_);
+        fprintf(stderr, "KVMEM_SEL n=%zu first=%u last=%u nblocks=%u have14=%d have16=%d tail_in=%d\n",
+                sb.size(),
+                sb.empty() ? 0u : sb.front(),
+                sb.empty() ? 0u : sb.back(),
+                nb,
+                (int) std::binary_search(sb.begin(), sb.end(), 14u),
+                (int) std::binary_search(sb.begin(), sb.end(), 16u),
+                (int) (!sb.empty() && sb.back() + 1 >= nb));
+        // Full membership dump: an aggregate cannot answer "was the block that holds
+        // the needle actually selected?" -- the earlier have14/have16 probes were
+        // hard-coded for a much smaller haystack and proved nothing.
+        fprintf(stderr, "KVMEM_SEL_IDS");
+        for (uint32_t id : sb) fprintf(stderr, " %u", id);
+        fprintf(stderr, "\n");
+    }
     if (enabled) {
         retr_.flush_us = t1 - t0;
         retr_.score_us = t2 - t1;
@@ -4738,7 +5098,15 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
             if (id >= store.block_count() || store.blocks()[id].gpu_slot < 0) {
                 continue;
             }
-            if (gpu_kv_already_resident(id)) {
+            // `plan.stage_in` is the store's own authoritative "these left the GPU"
+            // list. The cell probe below only proves that *cells* are still mapped;
+            // under KVarN attention reads the arena RECORD, and a recycled slot can
+            // hold the previous occupant's record while the cells still look live.
+            // Skipping the write-back then leaves restore_records() unrun, so the
+            // batch reads somebody else's K/V -- measured on the 27B needle test:
+            // n_stage_in=77 with n_skip=35 and the model answering the tail fact
+            // instead of the recalled one. Only trust the probe without an arena.
+            if (!kvarn_ && gpu_kv_already_resident(id)) {
                 n_skip++;
                 continue;
             }

@@ -350,6 +350,7 @@ private:
     //     sealed, so it too lives only in the F16 stage. See snapshot_records().
     bool block_records_snapshotable(uint32_t block_id) const;
     void snapshot_records(uint32_t block_id);
+    void snapshot_records_above(uint32_t token_pos);   // KVMEM-FIX(2026-09-26)
     bool restore_records(uint32_t block_id);
     void harvest_gpu_v(uint32_t block_id);
     void harvest_gpu_v_commit();

@@ -16,12 +16,14 @@ param(
     [string]$Repo    = "",
     [string]$Model   = "",
     [string]$Mmproj  = "",
+    [int]$NoSpec      = 0,   # 1 = 不传 --spec-type（小模型没有 MTP 头）
     [int]$Port        = 8486,
     [int]$PoolTokens  = 12288,
     [int]$GenReserve  = 4096,
     [int]$CtxSize     = 262144,
     [int]$TargetTokens = 30000,
     [int]$BlockTokens = 128,
+    [string]$KvType   = 'kvarn6',   # 行缓存对照用 q8_0
     [int]$DryRun      = 0,
     [string]$Log      = ""
 )
@@ -32,7 +34,7 @@ $ErrorActionPreference = 'Continue'
 if (-not $Repo)   { $Repo   = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 if (-not $Model)  { $Model  = $env:KVMEM_TEST_MODEL }
 if (-not $Mmproj) { $Mmproj = $env:KVMEM_TEST_MMPROJ }
-if (-not $Model -or -not (Test-Path $Model) -or -not $Mmproj -or -not (Test-Path $Mmproj)) {
+if (-not $Model -or -not (Test-Path $Model)) {
     Write-Host 'need a test model and its mmproj: -Model <model.gguf> -Mmproj <mmproj.gguf>,'
     Write-Host 'or set $env:KVMEM_TEST_MODEL and $env:KVMEM_TEST_MMPROJ.'
     exit 2
@@ -40,7 +42,7 @@ if (-not $Model -or -not (Test-Path $Model) -or -not $Mmproj -or -not (Test-Path
 if (-not $Log) { $Log = Join-Path $Repo 'logs\longctx-needle.log' }
 New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
 Remove-Item $Log -ErrorAction SilentlyContinue
-$exe    = Join-Path $Repo 'build-win\bin\llama-kvmem-server.exe'
+$exe    = if ($env:KVMEM_TEST_EXE) { $env:KVMEM_TEST_EXE } else { Join-Path $Repo 'build-mirror\bin\llama-kvmem-server.exe' }
 $needle = 'ZX-4711-QQ'
 $needle2 = 'QR-8823-LL'
 $tag    = 'ZX-4711'
@@ -69,18 +71,32 @@ $prompt1 = $hay + "`nIMPORTANT: the secret access code is $needle.`n"
 $prompt2 = $prompt1 + "`nQuestion: what is the secret access code? Reply with the code only.`n"
 $prompt3 = $prompt1 + "`nQuestion: what is the archive code from the beginning of the notes? Reply with the code only.`n"
 "干草堆: " + [int]($hay.Length/1024) + " KB, " + $i + " 条记录（目标 ~$TargetTokens token）；密文 = $needle"
+if ($env:KVMEM_TEST_DUMP) {
+    # The needle has to sit inside a block that retrieval actually selects, so its
+    # position must be MEASURED, not estimated from a chars/token ratio (that ratio
+    # is only good to ~15%, i.e. ~18 blocks at 128 tokens/block -- enough to change
+    # the verdict). Write the text out and tokenize it with llama-tokenize.
+    $note = "`nNOTE: the early archive code is $needle2.`n"
+    [IO.File]::WriteAllText("$($env:KVMEM_TEST_DUMP).prefix.txt", $hay.Substring(0, $early + $note.Length), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText("$($env:KVMEM_TEST_DUMP).prompt.txt", $prompt1, [Text.UTF8Encoding]::new($false))
+    "已写出 $($env:KVMEM_TEST_DUMP).prefix.txt / .prompt.txt（用于 llama-tokenize 精确测量针的 token 位置）"
+}
 if ($DryRun -eq 1) { "DryRun=1 ⇒ 只生成提示，不启动服务。"; exit 0 }
 
 # ---------- 2) 启动服务 ----------
-$srvArgs = @('-m',$Model,'--ctx-size',"$CtxSize",'--image-min-tokens','1024','--no-mmproj-offload','--mmproj',$Mmproj,
-             '--n-gpu-layers','99','--threads','12','--parallel','1','--flash-attn','on','--load-mode','none',
+$srvArgs = @('-m',$Model,'--ctx-size',"$CtxSize",'--n-gpu-layers','99','--threads','12','--parallel','1',
+             '--flash-attn','on','--load-mode','none',
              '--kvmem-budget',"$PoolTokens",'--kvmem-gen-reserve',"$GenReserve",'--kvmem-block-tokens',"$BlockTokens",
-             '--kv-dtype','kvarn6','--spec-draft-type-k','q8_0','--spec-draft-type-v','q8_0',
-             '--spec-type','draft-mtp','--spec-draft-n-max','3',
+             '--kv-dtype',$KvType,
              '--port',"$Port",'--alias','longctx-needle','--host','127.0.0.1','--timeout','600')
+if ($Mmproj -and (Test-Path $Mmproj)) {
+    $srvArgs += @('--image-min-tokens','1024','--no-mmproj-offload','--mmproj',$Mmproj,
+                  '--spec-draft-type-k','q8_0','--spec-draft-type-v','q8_0')
+}
+if (-not $NoSpec) { $srvArgs += @('--spec-type','draft-mtp','--spec-draft-n-max','3') }
 Get-Process llama-kvmem-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
-"启动服务（池 $PoolTokens token / block $BlockTokens / kvarn6 / MTP）..."
+"启动服务（池 $PoolTokens token / block $BlockTokens / $KvType / $(if ($NoSpec -eq 1) { '无 MTP' } else { 'MTP' })）..."
 $proc = Start-Process -FilePath $exe -ArgumentList $srvArgs -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" -PassThru -NoNewWindow
 $uri = "http://127.0.0.1:$Port/v1/chat/completions"
 function Wait-Ready([int]$TimeoutSec) {

@@ -38,12 +38,13 @@ if not exist "%CMAKE_EXE%" (
 if defined BUILD_DIR (
     set "BUILD=%BUILD_DIR%"
 ) else (
-    if exist "%ROOT%\build-win" (set "BUILD=%ROOT%\build-win") else (set "BUILD=%ROOT%\build")
+    if exist "%ROOT%\build-mirror\bin" (set "BUILD=%ROOT%\build-mirror") else if exist "%ROOT%\build-win" (set "BUILD=%ROOT%\build-win") else (set "BUILD=%ROOT%\build")
 )
 set "TYPE=Release"
 set "TARGET=kvmem-kvarn-smoke"
 set "EXE=%BUILD%\bin\%TYPE%\%TARGET%.exe"
 if not exist "%EXE%" set "EXE=%BUILD%\bin\%TARGET%.exe"
+if not exist "%EXE%" if exist "%ROOT%\build-mirror\bin\%TARGET%.exe" set "EXE=%ROOT%\build-mirror\bin\%TARGET%.exe"
 if not exist "%EXE%" if exist "%ROOT%\build-win\bin\%TARGET%.exe" set "EXE=%ROOT%\build-win\bin\%TARGET%.exe"
 if not exist "%EXE%" if exist "%ROOT%\build\bin\Release\%TARGET%.exe" set "EXE=%ROOT%\build\bin\Release\%TARGET%.exe"
 
@@ -63,7 +64,7 @@ if not exist "%MODEL%" (
 
 echo === [1/2] build %TARGET% ===
 REM No -j: the Visual Studio generator already parallelises through MSBuild.
-"%CMAKE_EXE%" --build "%BUILD%" --config %TYPE% --target %TARGET%
+if defined KVMEM_SKIP_BUILD (echo [matrix] KVMEM_SKIP_BUILD=1: reusing existing %EXE%) else ("%CMAKE_EXE%" --build "%BUILD%" --config %TYPE% --target %TARGET%)
 if %errorlevel% neq 0 if not exist "%EXE%" (
     echo RESULT: FAIL - build failed.
     endlocal
